@@ -16,7 +16,7 @@ except Exception as e:
     # 在使用组件前请确保安装 requests 和 beautifulsoup4  
     raise RuntimeError("请先安装 requests 和 beautifulsoup4: pip install requests beautifulsoup4 lxml") from e  
   
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"  
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.125 Safari/537.36"  
 HEADERS = {"User-Agent": USER_AGENT}  
   
   
