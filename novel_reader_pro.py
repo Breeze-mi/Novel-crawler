@@ -19,11 +19,18 @@ import shutil # 导入 shutil 模块
 from keledushu_index import fetch_html, extract_chapter_list_from_index_precise_fixed
 
 # set data dir to script directory (绿化)
-try:
-    SCRIPT_DIR = Path(__file__).resolve().parent
-except NameError:
-    SCRIPT_DIR = Path.cwd()
-APP_DIR = SCRIPT_DIR / ".pyside_novel_reader_reader_fixed"
+if getattr(sys, 'frozen', False):
+    # Running in a PyInstaller bundle
+    SCRIPT_DIR = Path(sys.executable).parent
+else:
+    # Running in a normal Python environment
+    try:
+        SCRIPT_DIR = Path(__file__).resolve().parent
+    except NameError:
+        SCRIPT_DIR = Path.cwd()
+        
+APP_DIR = SCRIPT_DIR / ".pyside_novel_reader_reader_fixed"# 应用数据目录
+
 APP_DIR.mkdir(parents=True, exist_ok=True)
 LIB_FILE = APP_DIR / "library.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
