@@ -374,7 +374,7 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.book_select.addItem(item)
 
     def import_book_dialog(self):
-        url, ok = QInputDialog.getText(self, "导入书籍（输入书籍首页 URL）")
+        url, ok = QInputDialog.getText(self, "导入书籍（输入书籍首页 URL）", "书籍首页 URL:")
         if not ok or not url.strip():
             return
         url = url.strip()
