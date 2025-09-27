@@ -1,0 +1,7 @@
+__pycache__
+.codebuddy
+.venv
+build
+dist
+.pyside_novel_reader_reader_fixed
+*.zip
