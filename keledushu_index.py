@@ -222,10 +222,10 @@ def _extract_from_dl_structure(dl_elements, base_url):
                                     latest_chapters.append({"title": title or None, "url": href})  
       
     # 优先返回正文卷，如果没有正文卷则返回最新章节（但需要反转顺序）  
-    if main_chapters:  
-        return main_chapters  
-    elif latest_chapters:  
-        # 最新章节通常是倒序的，需要反转  
+    if main_chapters:
+        return main_chapters
+    elif latest_chapters:
+        # 最新章节通常是倒序的，需要反转
         return list(reversed(latest_chapters))  
       
     return []  
