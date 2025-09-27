@@ -79,7 +79,7 @@ pyinstaller novel_reader_pro.spec
 
 ---
 
-To-Do List
+# To-Do List
 
 - [ ] 优化章节解析获取逻辑，提高解析准确性，解决章节丢失问题。
 - [ ] 完善对笔趣阁二开网站的支持，增加对其他小说网站的解析逻辑和支持。
