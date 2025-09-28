@@ -11,16 +11,24 @@ from PySide6.QtWidgets import (
     QInputDialog, QToolBar, QStatusBar
 )
 from PySide6.QtGui import QFont, QAction, QKeySequence, QShortcut
-from PySide6.QtCore import Qt, QTimer, QThread, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 import time
-import shutil # 导入 shutil 模块
+import shutil
 from bs4 import BeautifulSoup
-# import parsing component
-from analysis_index import fetch_html, extract_chapter_list_from_index_precise_fixed
+from analysis_index import (
+    fetch_html, 
+    extract_chapter_list_from_index_precise_fixed,
+    extract_title_and_content_from_chapter,
+    load_json,
+    save_json,
+    extract_book_title_from_html,
+    process_chapter_content_for_display,
+    ChapterFetchThread
+)
 # 导入样式
 from styles import DARK_STYLE, LIGHT_STYLE
 
-# set data dir to script directory (绿化)
+
 if getattr(sys, 'frozen', False):
     # Running in a PyInstaller bundle
     SCRIPT_DIR = Path(sys.executable).parent
@@ -30,8 +38,8 @@ else:
         SCRIPT_DIR = Path(__file__).resolve().parent
     except NameError:
         SCRIPT_DIR = Path.cwd()
-        
-APP_DIR = SCRIPT_DIR / ".pyside_novel_reader_reader_fixed"# 应用数据目录
+
+APP_DIR = SCRIPT_DIR / ".pyside_novel_reader_reader_fixed"  # 应用数据目录
 
 APP_DIR.mkdir(parents=True, exist_ok=True)
 LIB_FILE = APP_DIR / "library.json"
@@ -46,69 +54,12 @@ DEFAULT_SETTINGS = {
     "bg_color": "#D2B48C"
 }
 
-def load_json(path: Path, default):
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return default
-
-def save_json(path: Path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
 library = load_json(LIB_FILE, {})
 settings = load_json(SETTINGS_FILE, DEFAULT_SETTINGS.copy())
 
-# re-use extract_title_and_content_from_chapter from previous final (kept local here)
-
-def extract_title_and_content_from_chapter(html, base_url=None):
-    soup = BeautifulSoup(html, "lxml")
-    title = ""
-    if soup.find("h1"):
-        title = soup.find("h1").get_text(strip=True)
-    if not title and soup.title and soup.title.string:
-        title = soup.title.string.strip()
-        title = re.sub(r"\s*[-_—|].*$", "", title).strip()
-    ids = ("content", "chaptercontent", "contentbox", "read-content", "bookcontent", "txt", "nr1")
-    classes = ("content", "chapter-content", "read-content", "novel-content", "contentbox", "article", "maintext", "nr")
-    candidates = []
-    for idn in ids:
-        el = soup.find(id=idn)
-        if el: candidates.append(el)
-    for cls in classes:
-        for el in soup.find_all(class_=cls):
-            candidates.append(el)
-    if not candidates:
-        divs = [d for d in soup.find_all(['div','article','section']) if len(d.get_text(strip=True)) > 120]
-        divs.sort(key=lambda d: len(d.get_text()), reverse=True)
-        if divs:
-            candidates.append(divs[0])
-    for cont in candidates:
-        for bad in cont.select('script, style, iframe, noscript, .ads, .advert, .paybox'):
-            bad.decompose()
-        paragraphs = []
-        ps = cont.find_all('p')
-        if ps:
-            for p in ps:
-                t = p.get_text("\n", strip=True)
-                if t:
-                    paragraphs.append(t)
-        else:
-            raw = cont.get_text("\n", strip=True)
-            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-            paragraphs = lines
-        if paragraphs:
-            content = "\n\n".join(paragraphs)
-            return title or "", content, paragraphs
-    raw = soup.body.get_text("\n", strip=True) if soup.body else soup.get_text("\n", strip=True)
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    content = "\n\n".join(lines)
-    return title or "", content, lines
-
 # 自定义文本浏览器，支持手势翻页
 class GestureTextBrowser(QTextBrowser):
+    """自定义文本浏览器，支持手势翻页"""
     prev_chapter_requested = Signal()
     next_chapter_requested = Signal()
     
@@ -159,34 +110,6 @@ class GestureTextBrowser(QTextBrowser):
             # 发生错误时执行正常滚动
             super().wheelEvent(event)
 
-# Chapter fetch thread (same behavior)
-class ChapterFetchThread(QThread):
-    finished = Signal(int, dict, str)
-    progress = Signal(str)
-    def __init__(self, chapter_url, index, cache_dir):
-        super().__init__()
-        self.chapter_url = chapter_url
-        self.index = index
-        self.cache_dir = Path(cache_dir)
-    def run(self):
-        try:
-            json_path = self.cache_dir / f"{self.index:04d}.json"
-            if json_path.exists():
-                try:
-                    data = json.loads(json_path.read_text(encoding="utf-8"))
-                    self.finished.emit(self.index, data, "")
-                    return
-                except Exception:
-                    pass
-            self.progress.emit(f"请求章节: {self.chapter_url}")
-            html = fetch_html(self.chapter_url)
-            title, content, paragraphs = extract_title_and_content_from_chapter(html, base_url=self.chapter_url)
-            data = {"index": self.index, "title": title, "url": self.chapter_url, "content": content, "paragraphs": paragraphs}
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            self.finished.emit(self.index, data, "")
-        except Exception as e:
-            self.finished.emit(self.index, {}, str(e))
 
 
 # GUI main window (kept behavior and UI from previous final)
@@ -283,45 +206,33 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.night_cb.setChecked(self.settings.get("night_mode", False))
         self.night_cb.toggled.connect(self.toggle_night_mode)
         top_controls.addWidget(self.night_cb)
-
         right_col.addLayout(top_controls)
-
         self.text_browser = GestureTextBrowser()
         self.base_font = QFont(self.settings.get("font_family", "方正启体简体"), self.settings.get("font_size", 22))
         self.text_browser.setFont(self.base_font)
         self.text_browser.setOpenExternalLinks(True)
-        
         # 连接手势信号
         self.text_browser.prev_chapter_requested.connect(self.go_to_prev_chapter)
         self.text_browser.next_chapter_requested.connect(self.go_to_next_chapter)
-        
         right_col.addWidget(self.text_browser, 10)
-
         # 添加章节导航按钮
         nav_row = QHBoxLayout()
         self.prev_btn = QPushButton("← 上一章")
         self.prev_btn.clicked.connect(self.go_to_prev_chapter)
         self.prev_btn.setEnabled(False)
         nav_row.addWidget(self.prev_btn)
-        
         nav_row.addStretch()
-        
         self.chapter_info = QLabel("章节 0/0")
         nav_row.addWidget(self.chapter_info)
-        
         nav_row.addStretch()
-        
         self.next_btn = QPushButton("下一章 →")
         self.next_btn.clicked.connect(self.go_to_next_chapter)
         self.next_btn.setEnabled(False)
         nav_row.addWidget(self.next_btn)
-        
         right_col.addLayout(nav_row)
-
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         h.addLayout(right_col, 8)  # 从7改为8，增加右侧占用空间
-
         # timers
         self.save_timer = QTimer(self)
         self.save_timer.setInterval(3000)
@@ -337,7 +248,7 @@ class NovelReaderSidebarFixed(QMainWindow):
 
         self.refresh_book_select_list()
         self.apply_night_mode(self.night_cb.isChecked())
-
+        
     def closeEvent(self, event):
         """程序关闭时清理资源"""
         if self.fetch_thread and self.fetch_thread.isRunning():
@@ -397,13 +308,7 @@ class NovelReaderSidebarFixed(QMainWindow):
                 QMessageBox.warning(self, "导入失败", "未解析到章节列表，请检查 URL 是否为书籍目录页。")
                 return
             bid = str(abs(hash(url)))
-            soup_title = ""
-            try:
-                bs = BeautifulSoup(html, "lxml")
-                if bs.title and bs.title.string:
-                    soup_title = bs.title.string.strip().split("-")[0].strip()
-            except Exception:
-                pass
+            soup_title = extract_book_title_from_html(html)
             meta = {
                 "title": soup_title or f"在线书 {bid}",
                 "index_url": url,
@@ -422,7 +327,7 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.library[bid] = meta
             save_json(LIB_FILE, self.library)
             self.refresh_book_select_list()
-            QMessageBox.information(self, "导入成功", f"已导入书籍：{meta['title']}（共 {len(chapters)} 章）\n（debug 文件生成于脚本目录）")
+            QMessageBox.information(self, "导入成功", f"已导入书籍：{meta['title']}（共 {len(chapters)} 章）（debug 文件生成于脚本目录）")
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"请求或解析失败：{e}")
 
@@ -539,18 +444,16 @@ class NovelReaderSidebarFixed(QMainWindow):
         content = data.get("content") or ""
         self.title_label.setText(f"{self.library[self.current_book_id].get('title','')} — {title}")
         
-        # 根据夜间模式调整文字颜色
-        text_color = self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
-        if self.settings.get("night_mode", False):
-            text_color = "#d0d0d0"  # 夜间模式使用柔和的浅色文字
-        
-        html = "<div style='white-space:pre-wrap;font-family:%s;font-size:%dpt;line-height:%.2f;color:%s;padding:20px;'>%s</div>" % (
+        # 使用analysis_index.py中的函数处理章节内容
+        html = process_chapter_content_for_display(
+            content,
             self.settings.get("font_family", DEFAULT_SETTINGS["font_family"]),
             self.settings.get("font_size", 22),
             self.settings.get("line_height", 1.6),
-            text_color,
-            (content.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\n","<br>"))
+            self.settings.get("night_mode", False),
+            self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
         )
+        
         self.text_browser.setHtml(html)
         self.library[self.current_book_id]["chapter_index"] = index - 1
         save_json(LIB_FILE, self.library)
@@ -691,39 +594,43 @@ class NovelReaderSidebarFixed(QMainWindow):
         if book_dir_path.exists() and book_dir_path.is_dir():
             try:
                 shutil.rmtree(book_dir_path)
-                print(f"已删除书籍缓存目录: {book_dir_path}")
             except Exception as e:
-                QMessageBox.warning(self, "删除失败", f"无法删除书籍缓存目录 {book_dir_path}: {e}")
+                QMessageBox.warning(self, "删除失败", f"无法删除缓存目录: {str(e)}")
                 return
 
-        # 从 library 中删除书籍
-        if bid in self.library:
-            del self.library[bid]
-            save_json(LIB_FILE, self.library)
-            self.refresh_book_select_list()
-            self.text_browser.clear()
-            self.title_label.setText("未打开书")
-            self.chapter_list.clear()
+        # 从库中删除书籍
+        del self.library[bid]
+        save_json(LIB_FILE, self.library)
+        
+        # 刷新书籍列表
+        self.refresh_book_select_list()
+        
+        # 清空当前显示
+        if self.current_book_id == bid:
             self.current_book_id = None
             self.current_chapters = []
             self.current_book_dir = None
+            self.chapter_list.clear()
+            self.text_browser.clear()
+            self.title_label.setText("未打开书")
             self.update_navigation_buttons()
-            QMessageBox.information(self, "删除成功", f"书籍 '{meta.get('title', '未知书籍')}' 及其缓存已删除。")
-        else:
-            QMessageBox.warning(self, "错误", "书籍已不存在于库中。")
-        self.status.showMessage("书已移除", 2000)
+        
+        QMessageBox.information(self, "删除成功", "书籍已成功删除")
 
     def _auto_save(self):
-        save_json(SETTINGS_FILE, self.settings)
-        save_json(LIB_FILE, self.library)
-
-
-# app entry
+        """自动保存设置和库"""
+        try:
+            save_json(SETTINGS_FILE, self.settings)
+            save_json(LIB_FILE, self.library)
+        except Exception:
+            pass
 def main():
     app = QApplication(sys.argv)
-    win = NovelReaderSidebarFixed()
-    win.show()
+    app.setStyle("Fusion")  # 使用Fusion风格，在所有平台上看起来一致
+    window = NovelReaderSidebarFixed()
+    window.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
