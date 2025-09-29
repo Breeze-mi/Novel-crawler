@@ -2,18 +2,18 @@ import sys
 import json
 import re
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QTextBrowser, QPushButton, QLabel,
-    QLineEdit, QMessageBox, QSlider, QSpinBox, QCheckBox,
+    QLineEdit, QMessageBox, QSpinBox, QCheckBox,
     QInputDialog, QToolBar, QStatusBar
 )
 from PySide6.QtGui import QFont, QAction
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QThread
 import time
 import shutil
-from bs4 import BeautifulSoup
+
 from analysis_index import (
     fetch_html, 
     extract_chapter_list_from_index_precise_fixed,
@@ -26,6 +26,25 @@ from analysis_index import (
 )
 # 导入样式
 from styles import DARK_STYLE, LIGHT_STYLE
+
+# 目录获取线程：异步请求目录页与解析，避免阻塞UI
+class IndexFetchThread(QThread):
+    finished = Signal(list, str)  # chapters, error
+    progress = Signal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            self.progress.emit("请求目录页…")
+            html = fetch_html(self.url)
+            self.progress.emit("解析目录…")
+            chapters = extract_chapter_list_from_index_precise_fixed(html, self.url)
+            self.finished.emit(chapters, "")
+        except Exception as e:
+            self.finished.emit([], str(e))
 
 
 if getattr(sys, 'frozen', False):
@@ -163,6 +182,8 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.current_chapters = []
         self.current_book_dir = None
         self.fetch_thread = None
+        self.index_thread = None
+        self.progress_dialog = None
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -174,6 +195,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         
         # 书籍选择区域
         self.book_select = QListWidget()
+        self.book_select.setUniformItemSizes(True)
         self.book_select.setMaximumWidth(280)  # 减少宽度
         self.book_select.setMaximumHeight(120)  # 限制高度
         self.book_select.itemActivated.connect(self.on_book_selected)
@@ -184,7 +206,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         btn_grid.setSpacing(4)  # 减少按钮间距
         
         self.import_btn = QPushButton("导入书籍")  # 简化文字
-        self.import_btn.clicked.connect(self.import_book_dialog)
+        self.import_btn.clicked.connect(self.import_book_dialog_async)
         self.import_btn.setMaximumHeight(32)  # 限制按钮高度
         btn_grid.addWidget(self.import_btn)
         
@@ -192,7 +214,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(4)
         self.refresh_btn = QPushButton("刷新")
-        self.refresh_btn.clicked.connect(self.refresh_current_book_index)
+        self.refresh_btn.clicked.connect(self.refresh_current_book_index_async)
         self.refresh_btn.setMaximumHeight(32)
         btn_row.addWidget(self.refresh_btn)
         
@@ -224,6 +246,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.chapter_label.setMaximumHeight(20)
         left_col.addWidget(self.chapter_label)
         self.chapter_list = QListWidget()
+        self.chapter_list.setUniformItemSizes(True)
         self.chapter_list.itemActivated.connect(self.on_chapter_clicked)
         left_col.addWidget(self.chapter_list, 1)
 
@@ -280,10 +303,9 @@ class NovelReaderSidebarFixed(QMainWindow):
 
         tb = QToolBar("工具")
         self.addToolBar(tb)
-        tb.addAction(QAction("导入书籍", self, triggered=self.import_book_dialog))
-
-
-
+        act = QAction("导入书籍", self)
+        act.triggered.connect(self.import_book_dialog_async)
+        tb.addAction(act)
         self.refresh_book_select_list()
         self.apply_night_mode(self.night_cb.isChecked())
         
@@ -298,12 +320,14 @@ class NovelReaderSidebarFixed(QMainWindow):
 
     # UI / business methods (behaviour unchanged; where parsing occurs we call component)
     def refresh_book_select_list(self):
+        self.book_select.setUpdatesEnabled(False)
         self.book_select.clear()
         for bid, meta in self.library.items():
             t = meta.get("title") or meta.get("index_url") or bid
             item = QListWidgetItem(t)
             item.setData(Qt.UserRole, bid)
             self.book_select.addItem(item)
+        self.book_select.setUpdatesEnabled(True)
 
     def import_book_dialog(self):
         url, ok = QInputDialog.getText(self, "导入书籍（输入书籍首页 URL）", "书籍首页 URL:")
@@ -343,6 +367,150 @@ class NovelReaderSidebarFixed(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "导入失败", f"请求或解析失败：{e}")
 
+    def import_book_dialog_async(self):
+        url, ok = QInputDialog.getText(self, "导入书籍（输入书籍首页 URL）", "书籍首页 URL:")
+        if not ok or not url.strip():
+            return
+        url = url.strip()
+        ok2 = QMessageBox.question(self, "版权提醒", "请确保你抓取内容仅用于个人学习/备份。继续导入？")
+        if ok2 != QMessageBox.StandardButton.Yes:
+            return
+        # 异步导入，避免阻塞UI
+        if self.index_thread and self.index_thread.isRunning():
+            QMessageBox.information(self, "提示", "目录正在导入/刷新，请稍候")
+            return
+        self.index_thread = IndexFetchThread(url)
+        self.import_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.index_thread.progress.connect(lambda s: self.status.showMessage(s, 3000))
+        self.index_thread.finished.connect(lambda chapters, error: self._on_index_fetched_import(url, chapters, error))
+        # 显示导入进度弹窗
+        try:
+            from PySide6.QtWidgets import QProgressDialog
+            self.progress_dialog = QProgressDialog("正在导入目录…", None, 0, 0, self)
+            self.progress_dialog.setWindowTitle("正在导入")
+            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self.progress_dialog.setCancelButton(None)
+            self.progress_dialog.setAutoClose(False)
+            self.progress_dialog.setAutoReset(False)
+            self.progress_dialog.show()
+        except Exception:
+            pass
+        self.index_thread.start()
+
+    def _on_index_fetched_import(self, url, chapters, error):
+        # 恢复按钮
+        self.import_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        # 关闭进度弹窗
+        if getattr(self, "progress_dialog", None):
+            try:
+                self.progress_dialog.close()
+            except Exception:
+                pass
+            self.progress_dialog = None
+        if error:
+            QMessageBox.warning(self, "导入失败", f"请求或解析失败：{error}")
+            return
+        if not chapters:
+            QMessageBox.warning(self, "导入失败", "未解析到章节列表，请检查 URL 是否为书籍目录页。")
+            return
+        try:
+            bid = str(abs(hash(url)))
+            # 获取标题
+            try:
+                html_title = fetch_html(url)
+                soup_title = extract_book_title_from_html(html_title)
+            except Exception:
+                soup_title = ""
+            meta = {
+                "title": soup_title or f"在线书 {bid}",
+                "index_url": url,
+                "chapters": chapters,
+                "book_dir": str(APP_DIR / f"book_{bid}"),
+                "chapter_index": 0
+            }
+            bdir = Path(meta["book_dir"])
+            (bdir / "chapters").mkdir(parents=True, exist_ok=True)
+            try:
+                debug_path = bdir / "index_debug.json"
+                debug_path.write_text(json.dumps(chapters, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.library[bid] = meta
+            save_json(LIB_FILE, self.library)
+            self.refresh_book_select_list()
+            QMessageBox.information(self, "导入成功", f"已导入书籍：{meta['title']}（共 {len(chapters)} 章）（debug 文件生成于脚本目录）")
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", f"处理数据失败：{e}")
+
+    def refresh_current_book_index_async(self):
+        if not self.current_book_id:
+            QMessageBox.information(self, "提示", "请先选中一本书")
+            return
+        meta = self.library[self.current_book_id]
+        url = meta.get("index_url")
+        if not url:
+            QMessageBox.warning(self, "错误", "未记录书籍目录 URL")
+            return
+        # 异步刷新，避免阻塞UI
+        if self.index_thread and self.index_thread.isRunning():
+            QMessageBox.information(self, "提示", "目录正在导入/刷新，请稍候")
+            return
+        self.index_thread = IndexFetchThread(url)
+        self.refresh_btn.setEnabled(False)
+        self.import_btn.setEnabled(False)
+        self.index_thread.progress.connect(lambda s: self.status.showMessage(s, 3000))
+        self.index_thread.finished.connect(lambda chapters, error: self._on_index_fetched_refresh(chapters, error))
+        # 显示刷新进度弹窗
+        try:
+            from PySide6.QtWidgets import QProgressDialog
+            self.progress_dialog = QProgressDialog("正在刷新目录…", None, 0, 0, self)
+            self.progress_dialog.setWindowTitle("正在刷新")
+            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self.progress_dialog.setCancelButton(None)
+            self.progress_dialog.setAutoClose(False)
+            self.progress_dialog.setAutoReset(False)
+            self.progress_dialog.show()
+        except Exception:
+            pass
+        self.index_thread.start()
+
+    def _on_index_fetched_refresh(self, chapters, error):
+        # 恢复按钮
+        self.refresh_btn.setEnabled(True)
+        self.import_btn.setEnabled(True)
+        # 关闭进度弹窗
+        if getattr(self, "progress_dialog", None):
+            try:
+                self.progress_dialog.close()
+            except Exception:
+                pass
+            self.progress_dialog = None
+        if error:
+            QMessageBox.warning(self, "刷新失败", error)
+            return
+        if not chapters:
+            QMessageBox.warning(self, "失败", "未解析到章节")
+            return
+        meta = self.library[self.current_book_id]
+        try:
+            meta["chapters"] = chapters
+            meta["chapter_index"] = 0
+            save_json(LIB_FILE, self.library)
+            try:
+                bdir = Path(meta["book_dir"])
+                debug_path = bdir / "index_debug.json"
+                debug_path.write_text(json.dumps(chapters, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            self.open_book(self.current_book_id)
+            QMessageBox.information(self, "完成", f"目录已刷新，共 {len(chapters)} 章（并更新 debug 文件）")
+        except Exception as e:
+            QMessageBox.warning(self, "刷新失败", str(e))
+
+
+
     def on_book_selected(self, item):
         bid = item.data(Qt.UserRole)
         self.open_book(bid)
@@ -354,12 +522,14 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.title_label.setText(meta.get("title", "未命名书"))
         self.current_chapters = meta.get("chapters", [])
         self.current_book_dir = Path(meta.get("book_dir"))
+        self.chapter_list.setUpdatesEnabled(False)
         self.chapter_list.clear()
         for ch in self.current_chapters:
             display = f"{ch.get('index', '?')}. {ch.get('title') or ''}"
             it = QListWidgetItem(display)
             it.setData(Qt.UserRole, ch)
             self.chapter_list.addItem(it)
+        self.chapter_list.setUpdatesEnabled(True)
         self.text_browser.clear()
         self.text_browser.setHtml("<i>点击左侧章节条目以加载并查看该章节内容（按需抓取并缓存）。</i>")
         self.update_navigation_buttons()
