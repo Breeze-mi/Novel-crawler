@@ -11,6 +11,14 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from threading import Thread
 
+# 预编译常用正则，降低重复编译开销
+_RE_NUM_HTML_TAIL = re.compile(r'(\d+)\.html$', re.IGNORECASE)
+_RE_CHAPTER_CONTAINER_HINT = re.compile(r'全部章节|全部章|全部目录', re.IGNORECASE)
+_RE_ANCHOR_IN_UL = re.compile(r'<a\s+[^>]*href="(\d+\.html)"[^>]*>([^<]+)</a>', re.IGNORECASE)
+_RE_TITLE_CHAPNUM = re.compile(r'第\s*([0-9０-９零〇一二三四五六七八九十百千万]+)\s*[章掌回集卷]', re.IGNORECASE)
+_RE_TITLE_ANYNUM = re.compile(r'(?<!\d)(\d{1,6})(?!\d)')
+_RE_NAV_PATH = re.compile(r'/sort/|/author/|/fullbook/|/mybook|/cover/|/index', re.IGNORECASE)
+
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -111,10 +119,19 @@ def _is_chapter_href(href: str) -> bool:
     return href.lower().endswith(".html")
 
 def _parse_chapnum(t: str, u: str):
-    """从标题或URL解析章节号（容错：掌/章/张/中文数字/前导零/全角/回集卷）"""
+    """从标题或URL解析章节号（优化：优先URL尾数，标题为兜底；容错掌/章/中文数字/全角/前导零）"""
+    # 1) URL尾数优先（最快）
+    if u:
+        m_url = _RE_NUM_HTML_TAIL.search(u)
+        if m_url:
+            try:
+                return int(m_url.group(1))
+            except:
+                pass
+    # 2) 标题兜底（仅当URL无数字时使用复杂解析）
     if t:
         norm = _normalize_title(t)
-        m = re.search(r'第\s*([0-9０-９零〇一二三四五六七八九十百千万]+)\s*[章掌回集卷]', norm)
+        m = _RE_TITLE_CHAPNUM.search(norm)
         if m:
             s = m.group(1)
             s2 = ''.join(chr(ord(ch) - 65248) if '０' <= ch <= '９' else ch for ch in s).strip()
@@ -182,36 +199,42 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
             if found:
                 all_chapters_ul = found
 
-    # 2) fallback: find ul.chapter with nearby '全部章节' or the longest list
+    # 2) fallback: find ul.chapter with nearby '全部章节' or the longest list（优化：限域判断，减少文本获取）
     if not all_chapters_ul:
         uls = soup.find_all("ul", class_="chapter")
         candidate = None
         if uls:
+            # 优先选择有“全部章节”提示的容器
             for u in uls:
-                parent_text = u.parent.get_text(" ", strip=True) if u.parent else ""
-                if re.search(r'全部章节|全部章|全部目录', parent_text):
-                    candidate = u
-                    break
-                ok = False
-                for sib in u.previous_siblings:
-                    text = ""
-                    if hasattr(sib, "get_text"):
-                        text = sib.get_text(" ", strip=True)
-                    elif isinstance(sib, str):
-                        text = sib.strip()
-                    if text and re.search(r'全部章节|全部章|全部目录', text):
-                        ok = True
+                try:
+                    parent_text = u.parent.get_text(" ", strip=True) if u.parent else ""
+                    if parent_text and _RE_CHAPTER_CONTAINER_HINT.search(parent_text):
+                        candidate = u
                         break
-                if ok:
-                    candidate = u
-                    break
+                    ok = False
+                    for sib in u.previous_siblings:
+                        text = getattr(sib, "get_text", None)
+                        txt = text(" ", strip=True) if callable(text) else (sib.strip() if isinstance(sib, str) else "")
+                        if txt and _RE_CHAPTER_CONTAINER_HINT.search(txt):
+                            ok = True
+                            break
+                    if ok:
+                        candidate = u
+                        break
+                except Exception:
+                    continue
+            # 次选：选择 li 数最多的UL
             if candidate is None:
-                u_sorted = sorted(uls, key=lambda x: len(x.find_all("li")), reverse=True)
-                if u_sorted and len(u_sorted[0].find_all("li")) >= 5:
-                    candidate = u_sorted[0]
+                try:
+                    u_sorted = sorted(uls, key=lambda x: len(x.find_all("li")), reverse=True)
+                    if u_sorted and len(u_sorted[0].find_all("li")) >= 5:
+                        candidate = u_sorted[0]
+                except Exception:
+                    pass
         all_chapters_ul = candidate
 
     entries = []
+    seen = set()
     if all_chapters_ul:
         for a in all_chapters_ul.find_all("a", href=True):
             href_raw = a.get("href", "").strip()
@@ -220,12 +243,13 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
             href = urljoin(base_url, href_raw).split('#')[0].split('?')[0]
             if not _is_chapter_href(href):
                 continue
-            # 标题统一使用 get_text，避免属性类型导致解析失败
-            title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-            if re.search(r'首页|菜单|玄幻|武侠|言情|历史|网游|科幻|恐怖|其他|全本|书架', title):
+            if href in seen:
                 continue
+            title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
             entries.append({"title": title or None, "url": href})
+            seen.add(href)
     else:
+        # 整页回退扫描（优化：严格过滤路径，采集时去重，避免全页重复工作）
         seen = set()
         for a in soup.find_all("a", href=True):
             href_raw = a.get("href", "").strip()
@@ -236,50 +260,61 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
                 continue
             if not _is_chapter_href(href):
                 continue
-            # 标题统一使用 get_text，避免属性类型导致解析失败
+            path = (urlparse(href).path or "")
+            if _RE_NAV_PATH.search(path):
+                continue
             title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-            parsed = urlparse(href)
-            path = parsed.path or ""
-            if re.search(r'/sort/|/author/|/fullbook/|/mybook|/cover/|/index', path):
-                continue
-            if re.search(r'首页|菜单|玄幻|武侠|言情|历史|网游|科幻|恐怖|其他|全本|书架', title):
-                continue
-            seen.add(href)
             entries.append({"title": title or None, "url": href})
+            seen.add(href)
+
+    # 针对已定位的章节UL做一次受限正则补齐，避免Soup遗漏（性能友好）
+    try:
+        if all_chapters_ul:
+            entries = _supplement_entries_from_ul(entries, all_chapters_ul, base_url)
+    except Exception:
+        pass
 
     # 检查并尝试补齐缺失章节（基于标题/URL解析得到的章节号）
     try:
+        # 优化：仅在条目数较少或编号范围明确时进行缺章补齐；严格限流、仅在UL源码中扫描
         nums = []
         for e in entries:
-            n = _parse_chapnum(e.get("title") or "", e.get("url") or "")
+            # 优先用URL尾数（快速）
+            n = None
+            u = e.get("url") or ""
+            m_url = _RE_NUM_HTML_TAIL.search(u)
+            if m_url:
+                try:
+                    n = int(m_url.group(1))
+                except:
+                    n = None
+            if n is None:
+                n = _parse_chapnum(e.get("title") or "", u)  # 兜底
             if isinstance(n, int):
                 nums.append(n)
-        if nums:
+        if nums and len(nums) >= 5:
             nums.sort()
-            min_num = nums[0]
-            max_num = nums[-1]
+            min_num, max_num = nums[0], nums[-1]
+            # 大范围缺口补齐会非常耗时，这里限制最大补齐数量，且仅在UL源码中扫描
             expected = set(range(min_num, max_num + 1))
             present = set(nums)
             missing = sorted(expected - present)
-            if missing:
-                # 性能保护：限制缺失章节的补齐数量，避免在超大页面中正则耗时过长
-                if len(missing) > 300:
-                    missing = missing[:300]
+            if all_chapters_ul and missing:
+                limit = 120 if len(entries) > 1500 else 240
+                if len(missing) > limit:
+                    missing = missing[:limit]
                 existing_urls = {e["url"] for e in entries}
-                # 逐个缺失编号精准检索补齐
+                ul_html = str(all_chapters_ul)
                 for chapter_num in missing:
-                    patterns = [
+                    # 模式生成（避免大范围 re.search 多次拼接）
+                    patterns = (
                         rf'<a\s+[^>]*href="(\d+\.html)"[^>]*>\s*第\s*0*{chapter_num}\s*章[^<]*</a>',
                         rf'<a\s+[^>]*href="(\d+\.html)"[^>]*>\s*第\s*0*{chapter_num}\s*掌[^<]*</a>',
                         rf'<a\s+[^>]*href="(\d+\.html)"[^>]*>[^<]*{chapter_num}[^<]*</a>',
-                        rf'<a\s+[^>]*href="(\d+\.html)"[^>]*>\s*第\s*0*{chapter_num-1}\s*章[^<]*</a>' if chapter_num-1 >= min_num else None,
-                        rf'<a\s+[^>]*href="(\d+\.html)"[^>]*>\s*第\s*0*{chapter_num+1}\s*章[^<]*</a>' if chapter_num+1 <= max_num else None,
-                    ]
+                    )
                     found_entry = None
                     for pat in patterns:
-                        if not pat:
-                            continue
-                        m = re.search(pat, index_html, flags=re.IGNORECASE)
+                        m = re.search(pat, ul_html, flags=re.IGNORECASE)
                         if m:
                             href_rel = m.group(1)
                             full = m.group(0)
@@ -293,7 +328,6 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
                         entries.append(found_entry)
                         existing_urls.add(found_entry["url"])
     except Exception:
-        # 补齐失败不影响主流程
         pass
 
     return _finalize_entries(entries)
@@ -332,8 +366,7 @@ def _extract_from_dl_structure(dl_elements, base_url):
                             if _is_chapter_href(href):
                                 # 标题统一使用 get_text，避免属性类型导致解析失败
                                 title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-                                if not re.search(r'首页|菜单|玄幻|武侠|言情|历史|网游|科幻|恐怖|其他|全本|书架', title):
-                                    main_chapters.append({"title": title or None, "url": href})
+                                main_chapters.append({"title": title or None, "url": href})
 
             elif re.search(r'最新章节|最新|更新', dt_text):
                 # 这是最新章节列表
@@ -346,8 +379,7 @@ def _extract_from_dl_structure(dl_elements, base_url):
                             if _is_chapter_href(href):
                                 # 标题统一使用 get_text，避免属性类型导致解析失败
                                 title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-                                if not re.search(r'首页|菜单|玄幻|武侠|言情|历史|网游|科幻|恐怖|其他|全本|书架', title):
-                                    latest_chapters.append({"title": title or None, "url": href})
+                                latest_chapters.append({"title": title or None, "url": href})
 
     # 优先返回正文卷，如果没有正文卷则返回最新章节（但需要反转顺序）
     if main_chapters:
@@ -358,6 +390,26 @@ def _extract_from_dl_structure(dl_elements, base_url):
 
     return []
 
+
+def _supplement_entries_from_ul(entries, ul_el, base_url):
+    """从指定的章节UL源码中补齐遗漏的<a>锚点，仅在该UL范围内扫描，避免全页慢扫描"""
+    try:
+        if not ul_el:
+            return entries
+        existing = {e["url"] for e in entries}
+        ul_html = str(ul_el)
+        # 受限正则：只在该UL源码中匹配锚点
+        for m in re.finditer(r'<a\\s+[^>]*href="(\\d+\\.html)"[^>]*>([^<]+)</a>', ul_html, flags=re.IGNORECASE):
+            href_rel = m.group(1)
+            title_text = _normalize_title(_clean_text(m.group(2)))
+            url_abs = urljoin(base_url, href_rel).split('#')[0].split('?')[0]
+            if _is_chapter_href(url_abs) and url_abs not in existing:
+                entries.append({"title": title_text or None, "url": url_abs})
+                existing.add(url_abs)
+    except Exception:
+        # 补充失败不影响主流程
+        pass
+    return entries
 
 def _finalize_entries(entries):
     """最终处理章节列表：去重、添加索引和章节号"""
@@ -373,10 +425,19 @@ def _finalize_entries(entries):
 
     final = []
     for i, e in enumerate(cleaned, start=1):
-        chapnum = _parse_chapnum(e.get("title"), e["url"])
-        # 规范化显示标题，但保留原始含义
+        # 优先用URL尾数作为章节号（快速），标题作为兜底
+        url = e["url"]
+        chapnum = None
+        m_url = _RE_NUM_HTML_TAIL.search(url)
+        if m_url:
+            try:
+                chapnum = int(m_url.group(1))
+            except:
+                chapnum = None
+        if chapnum is None:
+            chapnum = _parse_chapnum(e.get("title"), url)
         title = _normalize_title(e.get("title") or (f"第{i}章" if chapnum is None else f"第{chapnum}章"))
-        final.append({"index": i, "title": title, "url": e["url"], "chapter_num": chapnum})
+        final.append({"index": i, "title": title, "url": url, "chapter_num": chapnum})
 
     # 仅按页面抓取顺序返回，避免标题中的异常数字导致排序错乱
     for i, e in enumerate(final, start=1):
