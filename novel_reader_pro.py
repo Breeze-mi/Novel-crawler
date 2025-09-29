@@ -184,6 +184,10 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.fetch_thread = None
         self.index_thread = None
         self.progress_dialog = None
+<<<<<<< HEAD
+=======
+        self.progress_dialog = None
+>>>>>>> 1cafbfb78d1a6c801ca1fffdf0ef90e52360f154
 
         root = QWidget()
         self.setCentralWidget(root)
