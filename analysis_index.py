@@ -534,6 +534,76 @@ def save_json(path: Path, obj):
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def create_book_directory_and_debug(meta, chapters):
+    """
+    创建书籍目录并保存调试文件
+    
+    参数:
+        meta: 书籍元数据
+        chapters: 章节列表
+    """
+    bdir = Path(meta["book_dir"])
+    (bdir / "chapters").mkdir(parents=True, exist_ok=True)
+    
+    try:
+        debug_path = bdir / "index_debug.json"
+        debug_path.write_text(json.dumps(chapters, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def generate_book_id_from_url(url):
+    """
+    从URL生成书籍ID
+    
+    参数:
+        url: 书籍URL
+        
+    返回:
+        str: 生成的书籍ID
+    """
+    return str(abs(hash(url)))
+
+
+def create_book_metadata(url, chapters, soup_title=None):
+    """
+    创建书籍元数据
+    
+    参数:
+        url: 书籍URL
+        chapters: 章节列表
+        soup_title: 从HTML提取的标题
+        
+    返回:
+        tuple: (book_id, metadata)
+    """
+    from pathlib import Path
+    import sys
+    
+    # 获取应用目录
+    if getattr(sys, 'frozen', False):
+        script_dir = Path(sys.executable).parent
+    else:
+        try:
+            script_dir = Path(__file__).resolve().parent
+        except NameError:
+            script_dir = Path.cwd()
+    
+    app_dir = script_dir / ".pyside_novel_reader_reader_fixed"
+    
+    bid = generate_book_id_from_url(url)
+    
+    meta = {
+        "title": soup_title or f"在线书 {bid}",
+        "index_url": url,
+        "chapters": chapters,
+        "book_dir": str(app_dir / f"book_{bid}"),
+        "chapter_index": 0
+    }
+    
+    return bid, meta
+
+
 def extract_book_title_from_html(html):
     """
     从HTML中提取书籍标题
@@ -579,6 +649,204 @@ def process_chapter_content_for_display(content, font_family, font_size, line_he
     html = f"""<div style='white-space:pre-wrap;font-family:{font_family};font-size:{font_size}pt;line-height:{line_height};color:{text_color};padding:20px;'>{processed_content}</div>"""
 
     return html
+
+
+# Index fetch thread - 处理目录获取和解析
+class IndexFetchThread(QThread):
+    """
+    目录获取线程：异步请求目录页与解析，避免阻塞UI
+    
+    包含内存优化的章节提取功能，支持大量章节的分批处理
+    """
+    finished = Signal(list, str)  # chapters, error
+    progress = Signal(str)
+    chapter_batch_ready = Signal(list, int, int)  # batch_chapters, current_count, total_estimated
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+        self._should_stop = False
+
+    def stop(self):
+        """停止线程执行"""
+        self._should_stop = True
+
+    def run(self):
+        """线程主执行函数"""
+        try:
+            self.progress.emit("请求目录页…")
+            html = fetch_html(self.url)
+            self.progress.emit("解析目录…")
+            
+            # 使用流式处理来避免内存峰值
+            chapters = self._extract_chapters_with_memory_optimization(html, self.url)
+            
+            if not self._should_stop:
+                self.finished.emit(chapters, "")
+        except Exception as e:
+            if not self._should_stop:
+                self.finished.emit([], str(e))
+
+    def _extract_chapters_with_memory_optimization(self, html, base_url):
+        """内存优化的章节提取方法"""
+        try:
+            # 首先快速估算章节数量
+            self.progress.emit("估算章节数量…")
+            estimated_count = self._estimate_chapter_count(html)
+            
+            if estimated_count > 3000:
+                # 对于大量章节，使用分批处理
+                self.progress.emit(f"检测到大量章节({estimated_count}+)，使用内存优化模式…")
+                return self._extract_chapters_in_batches(html, base_url, estimated_count)
+            else:
+                # 对于较少章节，使用原始方法
+                return extract_chapter_list_from_index_precise_fixed(html, base_url)
+                
+        except Exception as e:
+            # 如果优化方法失败，回退到原始方法
+            self.progress.emit("优化模式失败，回退到标准模式…")
+            return extract_chapter_list_from_index_precise_fixed(html, base_url)
+
+    def _estimate_chapter_count(self, html):
+        """快速估算章节数量"""
+        # 简单计算 .html 链接的数量作为估算
+        html_links = re.findall(r'href="[^"]*\.html"', html, re.IGNORECASE)
+        return len(html_links)
+
+    def _extract_chapters_in_batches(self, html, base_url, estimated_count):
+        """分批提取章节，减少内存占用"""
+        import gc
+        
+        all_chapters = []
+        batch_size = 500  # 每批处理500章
+        
+        try:
+            self.progress.emit("开始分批解析章节…")
+            
+            # 使用更轻量的解析方式
+            soup = BeautifulSoup(html, "lxml")
+            
+            # 找到章节容器
+            chapter_container = self._find_chapter_container(soup)
+            if not chapter_container:
+                # 如果找不到容器，回退到原始方法
+                return extract_chapter_list_from_index_precise_fixed(html, base_url)
+            
+            # 获取所有章节链接
+            chapter_links = chapter_container.find_all("a", href=True)
+            total_links = len(chapter_links)
+            
+            self.progress.emit(f"找到 {total_links} 个链接，开始分批处理…")
+            
+            processed_count = 0
+            batch_chapters = []
+            seen_urls = set()
+            
+            for i, link in enumerate(chapter_links):
+                if self._should_stop:
+                    break
+                    
+                try:
+                    href = link.get("href", "").strip()
+                    if not href:
+                        continue
+                        
+                    # 构建完整URL
+                    full_url = urljoin(base_url, href).split('#')[0].split('?')[0]
+                    
+                    # 检查是否为章节链接
+                    if not self._is_valid_chapter_url(full_url):
+                        continue
+                        
+                    # 避免重复
+                    if full_url in seen_urls:
+                        continue
+                    seen_urls.add(full_url)
+                    
+                    # 提取标题
+                    title = self._clean_title(link.get_text(strip=True))
+                    
+                    # 创建章节对象（轻量化）
+                    chapter = {
+                        "index": processed_count + 1,
+                        "title": title,
+                        "url": full_url
+                    }
+                    
+                    batch_chapters.append(chapter)
+                    processed_count += 1
+                    
+                    # 达到批次大小或处理完成时，处理当前批次
+                    if len(batch_chapters) >= batch_size or i == len(chapter_links) - 1:
+                        # 发送批次数据
+                        self.chapter_batch_ready.emit(batch_chapters.copy(), processed_count, total_links)
+                        
+                        # 添加到总列表
+                        all_chapters.extend(batch_chapters)
+                        
+                        # 清理当前批次，释放内存
+                        batch_chapters.clear()
+                        
+                        # 更新进度
+                        progress_pct = int((processed_count / total_links) * 100)
+                        self.progress.emit(f"已处理 {processed_count}/{total_links} 章节 ({progress_pct}%)")
+                        
+                        # 强制垃圾回收
+                        if processed_count % 1000 == 0:
+                            gc.collect()
+                            
+                except Exception as e:
+                    # 单个章节处理失败不影响整体
+                    continue
+            
+            self.progress.emit(f"章节解析完成，共 {len(all_chapters)} 章")
+            return all_chapters
+            
+        except Exception as e:
+            self.progress.emit(f"分批处理失败: {str(e)}")
+            # 回退到原始方法
+            return extract_chapter_list_from_index_precise_fixed(html, base_url)
+
+    def _find_chapter_container(self, soup):
+        """查找章节容器"""
+        # 尝试多种方式找到章节容器
+        containers = [
+            soup.find(id="allChapters2"),
+            soup.find(id="allChapters"),
+            soup.find("ul", class_="chapter"),
+            soup.find("div", class_="listmain"),
+            soup.find("div", id="list")
+        ]
+        
+        for container in containers:
+            if container and container.find_all("a", href=True):
+                return container
+        
+        # 如果都找不到，返回整个文档
+        return soup
+
+    def _is_valid_chapter_url(self, url):
+        """检查是否为有效的章节URL"""
+        # 必须是.html结尾
+        if not url.lower().endswith('.html'):
+            return False
+            
+        # 排除导航链接
+        path = urlparse(url).path or ""
+        nav_patterns = ['/sort/', '/author/', '/fullbook/', '/mybook', '/cover/', '/index']
+        for pattern in nav_patterns:
+            if pattern in path.lower():
+                return False
+                
+        return True
+
+    def _clean_title(self, title):
+        """清理章节标题"""
+        if not title:
+            return ""
+        # 移除多余空白
+        title = re.sub(r'\s+', ' ', title.strip())
+        return title
 
 
 # Chapter fetch thread
@@ -640,5 +908,9 @@ __all__ = [
     "process_chapter_content_for_display",
     "load_json",
     "save_json",
+    "create_book_directory_and_debug",
+    "generate_book_id_from_url",
+    "create_book_metadata",
+    "IndexFetchThread",
     "ChapterFetchThread"
 ]
