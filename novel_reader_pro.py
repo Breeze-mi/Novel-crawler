@@ -3,14 +3,13 @@ import json
 import re
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
-
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QTextBrowser, QPushButton, QLabel,
     QLineEdit, QMessageBox, QSlider, QSpinBox, QCheckBox,
     QInputDialog, QToolBar, QStatusBar
 )
-from PySide6.QtGui import QFont, QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QAction
 from PySide6.QtCore import Qt, QTimer, Signal
 import time
 import shutil
@@ -65,49 +64,89 @@ class GestureTextBrowser(QTextBrowser):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.scroll_threshold = 120  # 增加滚轮阈值，减少误触发
-        self.accumulated_scroll = 0
-        self.last_gesture_time = 0
-        self.gesture_cooldown = 1000  # 1秒冷却时间，防止连续触发
+        # 分离上下翻页阈值与对齐保护参数
+        self.prev_threshold = 340   # 顶部触发上一章更不敏感，避免误翻
+        self.next_threshold = 120   # 底部触发下一章更灵敏
+        self.small_scroll_ignore = 66  # 边缘小幅滚动直接消费，用于对齐保护
+        self.top_enter_time = 0     # 进入顶部的时间戳(ms)
+        self.bottom_enter_time = 0  # 进入底部的时间戳(ms)
+        self.accumulated_scroll = 0  # 累积滚轮值
+        self.last_gesture_time = 0   # 记录上一次手势触发时间
+        self.gesture_cooldown = 700  # 冷却时间(毫秒)，稳定翻页
         
     def wheelEvent(self, event):
         try:
-            # 获取滚动条位置
-            scrollbar = self.verticalScrollBar()
-            at_top = scrollbar.value() == scrollbar.minimum()
-            at_bottom = scrollbar.value() == scrollbar.maximum()
-            
-            # 获取滚轮滚动方向
+            sb = self.verticalScrollBar()
+            minv = sb.minimum()
+            maxv = sb.maximum()
+            val = sb.value()
+            edge_tol = 2  # 边缘容差，避免像素误差导致判定不稳
+            at_top = val <= (minv + edge_tol)
+            at_bottom = val >= (maxv - edge_tol)
+
             delta = event.angleDelta().y()
-            
-            # 检查冷却时间
-            current_time = time.time() * 1000
-            if current_time - self.last_gesture_time < self.gesture_cooldown:
+            now_ms = time.monotonic() * 1000
+
+            # 进入边缘时记录时间，用于滞后判定
+            if at_top:
+                if self.top_enter_time == 0:
+                    self.top_enter_time = now_ms
+            else:
+                self.top_enter_time = 0
+
+            if at_bottom:
+                if self.bottom_enter_time == 0:
+                    self.bottom_enter_time = now_ms
+            else:
+                self.bottom_enter_time = 0
+
+            # 冷却期内允许正常滚动
+            if now_ms - self.last_gesture_time < self.gesture_cooldown:
                 super().wheelEvent(event)
                 return
-            
+
+            # 方向变化时重置累积
+            if (self.accumulated_scroll > 0 and delta < 0) or (self.accumulated_scroll < 0 and delta > 0):
+                self.accumulated_scroll = 0
+
+            # 顶部向上：上一章（增加滞后与小幅对齐保护）
             if at_top and delta > 0:
-                # 在顶部向上滚动 - 上一章
+                # 小幅滚动用于对齐，直接消费不累积，避免误触发上一章
+                if delta < self.small_scroll_ignore or (self.top_enter_time and (now_ms - self.top_enter_time) < 250):
+                    event.accept()
+                    return
                 self.accumulated_scroll += delta
-                if self.accumulated_scroll > self.scroll_threshold:
+                if self.accumulated_scroll >= self.prev_threshold:
                     self.prev_chapter_requested.emit()
                     self.accumulated_scroll = 0
-                    self.last_gesture_time = current_time
-                # 不调用super()，防止滚动
-            elif at_bottom and delta < 0:
-                # 在底部向下滚动 - 下一章
+                    self.last_gesture_time = now_ms
+                    event.accept()
+                    return
+                else:
+                    # 边缘对齐保护
+                    event.accept()
+                    return
+
+            # 底部向下：下一章（更灵敏）
+            if at_bottom and delta < 0:
+                if abs(delta) < self.small_scroll_ignore or (self.bottom_enter_time and (now_ms - self.bottom_enter_time) < 120):
+                    event.accept()
+                    return
                 self.accumulated_scroll += abs(delta)
-                if self.accumulated_scroll > self.scroll_threshold:
+                if self.accumulated_scroll >= self.next_threshold:
                     self.next_chapter_requested.emit()
                     self.accumulated_scroll = 0
-                    self.last_gesture_time = current_time
-                # 不调用super()，防止滚动
-            else:
-                # 正常滚动
-                self.accumulated_scroll = 0
-                super().wheelEvent(event)
-        except Exception as e:
-            # 发生错误时执行正常滚动
+                    self.last_gesture_time = now_ms
+                    event.accept()
+                    return
+                else:
+                    event.accept()
+                    return
+
+            # 非边缘正常滚动
+            self.accumulated_scroll = 0
+            super().wheelEvent(event)
+        except Exception:
             super().wheelEvent(event)
 
 
@@ -232,7 +271,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         right_col.addLayout(nav_row)
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        h.addLayout(right_col, 8)  # 从7改为8，增加右侧占用空间
+        h.addLayout(right_col, 8)  
         # timers
         self.save_timer = QTimer(self)
         self.save_timer.setInterval(3000)
@@ -243,8 +282,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.addToolBar(tb)
         tb.addAction(QAction("导入书籍", self, triggered=self.import_book_dialog))
 
-        # 添加键盘快捷键
-        self.setup_shortcuts()
+
 
         self.refresh_book_select_list()
         self.apply_night_mode(self.night_cb.isChecked())
@@ -256,33 +294,7 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.fetch_thread.wait()
         event.accept()
 
-    def setup_shortcuts(self):
-        """设置键盘快捷键"""
-        # 上一章
-        prev_shortcuts = [
-            QShortcut(QKeySequence(Qt.Key_Left), self),
-            QShortcut(QKeySequence(Qt.Key_PageUp), self),
-            QShortcut(QKeySequence("Ctrl+Left"), self)
-        ]
-        for shortcut in prev_shortcuts:
-            shortcut.activated.connect(self.go_to_prev_chapter)
-        
-        # 下一章
-        next_shortcuts = [
-            QShortcut(QKeySequence(Qt.Key_Right), self),
-            QShortcut(QKeySequence(Qt.Key_PageDown), self),
-            QShortcut(QKeySequence("Ctrl+Right"), self)
-        ]
-        for shortcut in next_shortcuts:
-            shortcut.activated.connect(self.go_to_next_chapter)
-        
-        # 第一章
-        first_shortcut = QShortcut(QKeySequence(Qt.Key_Home), self)
-        first_shortcut.activated.connect(self.go_to_first_chapter)
-        
-        # 最后一章
-        last_shortcut = QShortcut(QKeySequence(Qt.Key_End), self)
-        last_shortcut.activated.connect(self.go_to_last_chapter)
+
 
     # UI / business methods (behaviour unchanged; where parsing occurs we call component)
     def refresh_book_select_list(self):
