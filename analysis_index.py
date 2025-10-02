@@ -9,19 +9,19 @@ import time
 import json
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
-from threading import Thread
 
 # 预编译常用正则，降低重复编译开销
 _RE_NUM_HTML_TAIL = re.compile(r'(\d+)\.html$', re.IGNORECASE)
 _RE_CHAPTER_CONTAINER_HINT = re.compile(r'全部章节|全部章|全部目录', re.IGNORECASE)
 _RE_ANCHOR_IN_UL = re.compile(r'<a\s+[^>]*href="(\d+\.html)"[^>]*>([^<]+)</a>', re.IGNORECASE)
 _RE_TITLE_CHAPNUM = re.compile(r'第\s*([0-9０-９零〇一二三四五六七八九十百千万]+)\s*[章掌回集卷]', re.IGNORECASE)
-_RE_TITLE_ANYNUM = re.compile(r'(?<!\d)(\d{1,6})(?!\d)')
-_RE_NAV_PATH = re.compile(r'/sort/|/author/|/fullbook/|/mybook|/cover/|/index', re.IGNORECASE)
+_RE_NAV_PATH = re.compile(r'/sort/|/author/|/fullbook/|/mybook|/cover/|/index|/class\\d+-|/quanben|/top|/dll|/user/', re.IGNORECASE)
+# 分页页匹配（常见于目录分页，如 index_2.html / list_2.html）
+_RE_PAGINATION = re.compile(r'(?:^|/)(?:index|list)_(\d+)\.html$', re.IGNORECASE)
 
 try:
     import requests
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Tag
 except Exception as e:
     # 在使用组件前请确保安装 requests 和 beautifulsoup4
     raise RuntimeError("请先安装 requests 和 beautifulsoup4: pip install requests beautifulsoup4 lxml") from e
@@ -49,20 +49,141 @@ except ImportError:
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.125 Safari/537.36"
 HEADERS = {"User-Agent": USER_AGENT}
 
+def _bs(html):
+    """
+    安全构造 BeautifulSoup：
+    - 将输入统一转换为 UTF-8 字节（errors="replace"），避免 lxml 在内部重编码时报错
+    - 优先使用 lxml 解析，失败则回退到内置 html.parser
+    """
+    try:
+        if isinstance(html, bytes):
+            data = html
+        else:
+            data = (html or "").encode("utf-8", "replace")
+        return BeautifulSoup(data, "lxml", from_encoding="utf-8")
+    except Exception:
+        try:
+            return BeautifulSoup(html or "", "html.parser")
+        except Exception:
+            return BeautifulSoup("", "html.parser")
+
 
 def fetch_html(url: str, timeout: int = 20, retries: int = 3) -> str:
-    """简单的 GET 请求带重试，返回响应文本（自动检测编码）。"""
+    """GET 请求带重试，字节级解码，稳健支持 gbk/gb18030/utf-8，避免目录/分页乱码造成解析丢失。"""
+    def _detect_charset_from_headers(ct: str) -> str:
+        if not ct:
+            return ""
+        m = re.search(r'charset\s*=\s*([A-Za-z0-9_\-]+)', ct, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        enc = m.group(1).strip().lower()
+        return enc
+
+    def _detect_charset_from_meta(raw: bytes) -> str:
+        try:
+            # <meta charset="gbk"> 或 <meta http-equiv="Content-Type" content="text/html; charset=gbk">
+            m1 = re.search(br'<meta[^>]+charset=["\']?\s*([A-Za-z0-9_\-]+)\s*["\']?', raw, flags=re.IGNORECASE)
+            if m1:
+                return m1.group(1).decode("ascii", "ignore").lower()
+            m2 = re.search(br'<meta[^>]+content=["\'][^"]*charset\s*=\s*([A-Za-z0-9_\-]+)[^"\']*["\']', raw, flags=re.IGNORECASE)
+            if m2:
+                return m2.group(1).decode("ascii", "ignore").lower()
+        except Exception:
+            pass
+        return ""
+
+    def _normalize_html(txt: str) -> str:
+        # 统一换行，去除 BOM
+        if txt and txt[0] == "\ufeff":
+            txt = txt[1:]
+        return txt.replace("\r\n", "\n").replace("\r", "\n")
+
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding
-            return r.text
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            raw = resp.content or b""
+            if not raw:
+                return ""
+
+            enc = _detect_charset_from_headers(resp.headers.get("Content-Type", "")) or _detect_charset_from_meta(raw)
+
+            # 将 gbk 统一映射为 gb18030，覆盖更多汉字范围
+            candidates = []
+            if enc:
+                enc_low = enc.lower()
+                if enc_low in ("gbk", "gb2312"):
+                    candidates.append("gb18030")
+                else:
+                    candidates.append(enc_low)
+            # 常见优先
+            candidates.extend(["utf-8", "gb18030"])
+
+            last_err = None
+            for codec in candidates:
+                try:
+                    txt = raw.decode(codec, errors="strict")
+                    return _normalize_html(txt)
+                except Exception as e:
+                    last_err = e
+                    continue
+            # 最终兜底：宽松解码，确保不因个别字符中断
+            try:
+                txt = raw.decode("gb18030", errors="replace")
+                return _normalize_html(txt)
+            except Exception:
+                if last_err:
+                    raise last_err
+                raise
         except Exception:
             if attempt == retries:
                 raise
             time.sleep(0.3 * attempt)
 
+
+def _locate_full_chapter_index(url: str, html: str) -> str:
+    """从详情页 HTML 中定位完整章节目录页。找到则返回绝对URL，否则返回空字符串。"""
+    try:
+        netloc = (urlparse(url).netloc or "").lower()
+        path = (urlparse(url).path or "")
+
+        # 优先从 meta/mobile-agent 或 OG 标签中读取移动目录地址
+        try:
+            soup = _bs(html)
+            # og:novel:read_url / og:url
+            for prop in ("og:novel:read_url", "og:url"):
+                m = soup.find("meta", attrs={"property": prop})
+                if m and m.get("content"):
+                    cu = str(m.get("content")).strip()
+                    if cu and "/book/" in cu and cu.endswith("/"):
+                        return cu
+            # 页面中的“手机版/移动版”链接
+            for a in soup.find_all("a", href=True):
+                href = (a.get("href") or "").strip()
+                if href and "/book/" in href:
+                    absu = _abs_url(url, href)
+                    if "m." in (urlparse(absu).netloc or "") and absu.endswith("/"):
+                        return absu
+        except Exception:
+            pass
+
+        # 适配 tbxsvv.cc / tbxsw.cc：PC目录形如 /html/140/140582/ -> 移动目录 https://m.{root}/book/140582/
+        if ("tbxsvv.cc" in netloc) or ("tbxsw.cc" in netloc):
+            m = re.search(r'/html/\d+/(\d+)/', path)
+            if m:
+                book_id = m.group(1)
+                root = netloc.split(".", 1)[-1]  # tbxsvv.cc or tbxsw.cc
+                return f"https://m.{root}/book/{book_id}/"
+
+        # 适配 syvvw.cc：详情页 /1/{id}/ 跳到 /book/{id}.html
+        if "syvvw.cc" in netloc:
+            m = re.search(r'href=["\'](/book/\d+\.html)["\']', html, flags=re.IGNORECASE)
+            if m:
+                return _abs_url(url, m.group(1))
+
+    except Exception:
+        pass
+    return ""
 
 # -- 内部工具函数（组件内部使用） --
 def _clean_text(s: str) -> str:
@@ -76,8 +197,10 @@ def _normalize_title(title: str) -> str:
     t = _clean_text(title or "")
     if not t:
         return t
-    # 将“第...张/璋/漳/仗”归一化为“章”，仅在模式位置替换，避免误改正文
-    t = re.sub(r'(第\s*[零〇一二三四五六七八九十百千万0-9]+\s*)[张璋漳仗]', r'\1章', t)
+    # 常见错字归一：'底/都' -> '第'（仅限章节号位置前缀）
+    t = re.sub(r'^(底|都)(\s*[零〇一二三四五六七八九十百千万0-9]+)', r'第\2', t)
+    # 将“第...张/璋/漳/仗/中/钟/衷”归一化为“章”，仅在模式位置替换
+    t = re.sub(r'(第\s*[零〇一二三四五六七八九十百千万0-9]+\s*)[张璋漳仗中钟衷]', r'\1章', t)
     # 统一空白
     t = re.sub(r'\s+', ' ', t).strip()
     return t
@@ -117,6 +240,60 @@ def _is_chapter_href(href: str) -> bool:
     if href.lower().startswith("javascript:") or href.startswith("#"):
         return False
     return href.lower().endswith(".html")
+
+def _abs_url(base_url: str, href_raw: str) -> str:
+    """将相对链接规范化为绝对URL，并去除 #/? 尾部碎片"""
+    if not href_raw:
+        return ""
+    return urljoin(base_url, href_raw).split('#')[0].split('?')[0]
+
+def _is_nav_path(url: str) -> bool:
+    """判定URL路径是否为站点导航类路径"""
+    path = (urlparse(url).path or "")
+    return bool(_RE_NAV_PATH.search(path))
+
+# 非章节标题噪声过滤（常见于移动站“直达页面底部/加入书架”等）
+_RE_NOISE_TITLE = re.compile(r'(直达页面底部|直达底部|直达底|加入书架)', re.IGNORECASE)
+def _is_noise_title(title: str) -> bool:
+    t = _normalize_title(title or "")
+    if not t:
+        return False
+    return bool(_RE_NOISE_TITLE.search(t))
+
+# 基于 href 的噪声过滤（含锚点跳转、页底关键词等）
+def _is_noise_href(href_raw: str) -> bool:
+    if not href_raw:
+        return False
+    s = href_raw.strip().lower()
+    # 直接锚点或包含锚点的底部跳转
+    if s.startswith("#"):
+        return True
+    if "#footer" in s or "#bottom" in s or "footer" in s and ".html" in s:
+        return True
+    # 常见“直达底部/页底”关键词
+    return ("底部" in s or "页底" in s) and (s.startswith("javascript:") or "#" in s or ".html" in s)
+
+def _entry_from_anchor(a, base_url: str):
+    """
+    将 <a> 标签解析为章节条目：
+      - 过滤无效/噪声 href（javascript:, #, 页底等）
+      - 归一化绝对URL，仅接受以 .html 结尾的章节链接
+      - 清洗并归一化标题，过滤“直达底部/加入书架”等噪声标题
+    返回: dict{"title": str|None, "url": str} 或 None
+    """
+    try:
+        href_raw = (a.get("href") or "").strip()
+        if not href_raw or _is_noise_href(href_raw):
+            return None
+        href = _abs_url(base_url, href_raw)
+        if not _is_chapter_href(href) or _is_nav_path(href):
+            return None
+        title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
+        if _is_noise_title(title):
+            return None
+        return {"title": title or None, "url": href}
+    except Exception:
+        return None
 
 def _parse_chapnum(t: str, u: str):
     """从标题或URL解析章节号（优化：优先URL尾数，标题为兜底；容错掌/章/中文数字/全角/前导零）"""
@@ -172,7 +349,7 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
       - 保持页面 DOM 顺序（避免盲目按 URL 数字排序造成乱序或丢章）；
       - 尝试解析章节号（title 或 url 的尾部数字），放到 chapter_num 中，便于后续校验/排序。
     """
-    soup = BeautifulSoup(index_html, "lxml")
+    soup = _bs(index_html)
 
     # 检测是否为笔趣看风格的 <dl> 结构
     dl_elements = soup.find_all("dl")
@@ -237,34 +414,25 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
     seen = set()
     if all_chapters_ul:
         for a in all_chapters_ul.find_all("a", href=True):
-            href_raw = a.get("href", "").strip()
-            if not href_raw:
+            e = _entry_from_anchor(a, base_url)
+            if not e:
                 continue
-            href = urljoin(base_url, href_raw).split('#')[0].split('?')[0]
-            if not _is_chapter_href(href):
-                continue
+            href = e["url"]
             if href in seen:
                 continue
-            title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-            entries.append({"title": title or None, "url": href})
+            entries.append(e)
             seen.add(href)
     else:
         # 整页回退扫描（优化：严格过滤路径，采集时去重，避免全页重复工作）
         seen = set()
         for a in soup.find_all("a", href=True):
-            href_raw = a.get("href", "").strip()
-            if not href_raw:
+            e = _entry_from_anchor(a, base_url)
+            if not e:
                 continue
-            href = urljoin(base_url, href_raw).split('#')[0].split('?')[0]
+            href = e["url"]
             if href in seen:
                 continue
-            if not _is_chapter_href(href):
-                continue
-            path = (urlparse(href).path or "")
-            if _RE_NAV_PATH.search(path):
-                continue
-            title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-            entries.append({"title": title or None, "url": href})
+            entries.append(e)
             seen.add(href)
 
     # 针对已定位的章节UL做一次受限正则补齐，避免Soup遗漏（性能友好）
@@ -320,13 +488,108 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
                             full = m.group(0)
                             tmatch = re.search(r'>([^<]+)</a>', full)
                             title_text = _normalize_title(_clean_text(tmatch.group(1) if tmatch else f"第{chapter_num}章"))
-                            url_abs = urljoin(base_url, href_rel).split('#')[0].split('?')[0]
+                            url_abs = _abs_url(base_url, href_rel)
                             if url_abs not in existing_urls:
                                 found_entry = {"title": title_text, "url": url_abs}
                             break
                     if found_entry:
                         entries.append(found_entry)
                         existing_urls.add(found_entry["url"])
+    except Exception:
+        pass
+
+    # 目录分页抓取与合并（如 index_2.html / list_2.html）- 优先下拉页码顺序遍历，未命中再回退 BFS
+    try:
+        # 优先：从首页下拉列表收集全部分页，按页码升序遍历
+        pages = []
+        pages.append((1, base_url))  # 第1页
+
+        try:
+            options = soup.find_all("option")
+            for opt in options:
+                val = str(opt.get("value") or "").strip()
+                if not val:
+                    continue
+                absu = _abs_url(base_url, val)
+                m = _RE_PAGINATION.search((urlparse(absu).path or ""))
+                if m:
+                    idx = int(m.group(1))
+                    if idx >= 2:
+                        pages.append((idx, absu))
+            # 去重并按页码排序
+            seenp = set()
+            pages = sorted([(i, u) for i, u in pages if not (u in seenp or seenp.add(u))], key=lambda x: x[0])
+        except Exception:
+            pages = [(1, base_url)]
+
+        # 若存在 index_2.html 之类分页，则严格按“正文”列表逐页采集（每页20条）
+        has_paged = any(i >= 2 for i, _ in pages)
+        if has_paged:
+            entries = []
+            for idx, purl in pages:
+                try:
+                    p_html = index_html if idx == 1 else fetch_html(purl)
+                    page_entries = _extract_entries_from_paged_html(p_html, purl)
+                    if page_entries:
+                        entries.extend(page_entries)
+                except Exception:
+                    continue
+        else:
+            # 回退：使用原 BFS 方案发现其它分页
+            def collect_pagination_urls(soup_obj, current_url):
+                found = set()
+                cpath = (urlparse(current_url).path or "")
+                cdir = cpath[: cpath.rfind("/") + 1] if "/" in cpath else cpath
+
+                for a in soup_obj.find_all("a", href=True):
+                    rel = (a.get("href") or "").strip()
+                    if not rel:
+                        continue
+                    absu = _abs_url(current_url, rel)
+                    path = (urlparse(absu).path or "")
+                    if not _RE_PAGINATION.search(path):
+                        continue
+                    if cdir and not path.startswith(cdir):
+                        continue
+                    if absu and absu != current_url:
+                        found.add(absu)
+
+                for opt in soup_obj.find_all("option"):
+                    val = str(opt.get("value") or "").strip()
+                    if not val:
+                        continue
+                    absu = _abs_url(current_url, val)
+                    path = (urlparse(absu).path or "")
+                    if not _RE_PAGINATION.search(path):
+                        continue
+                    if cdir and not path.startswith(cdir):
+                        continue
+                    if absu and absu != current_url:
+                        found.add(absu)
+                return found
+
+            visited = set([base_url])
+            queue = list(collect_pagination_urls(soup, base_url))
+            for u in queue:
+                visited.add(u)
+
+            i = 0
+            while i < len(queue):
+                purl = queue[i]
+                i += 1
+                try:
+                    p_html = fetch_html(purl)
+                    p_soup = _bs(p_html)
+                    page_entries = _extract_entries_from_paged_html(p_html, purl)
+                    if page_entries:
+                        entries.extend(page_entries)
+                    more = collect_pagination_urls(p_soup, purl)
+                    for nxt in more:
+                        if nxt not in visited:
+                            visited.add(nxt)
+                            queue.append(nxt)
+                except Exception:
+                    continue
     except Exception:
         pass
 
@@ -339,6 +602,8 @@ def _extract_from_dl_structure(dl_elements, base_url):
     latest_chapters = []  # 最新章节
 
     for dl in dl_elements:
+        if not hasattr(dl, "find_all"):
+            continue
         dt_elements = dl.find_all("dt")
 
         for dt in dt_elements:
@@ -360,26 +625,18 @@ def _extract_from_dl_structure(dl_elements, base_url):
                 for dd in dd_elements:
                     a = dd.find("a", href=True)
                     if a:
-                        href_raw = a.get("href", "").strip()
-                        if href_raw:
-                            href = urljoin(base_url, href_raw).split('#')[0].split('?')[0]
-                            if _is_chapter_href(href):
-                                # 标题统一使用 get_text，避免属性类型导致解析失败
-                                title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-                                main_chapters.append({"title": title or None, "url": href})
+                        e = _entry_from_anchor(a, base_url)
+                        if e:
+                            main_chapters.append(e)
 
             elif re.search(r'最新章节|最新|更新', dt_text):
                 # 这是最新章节列表
                 for dd in dd_elements:
                     a = dd.find("a", href=True)
                     if a:
-                        href_raw = a.get("href", "").strip()
-                        if href_raw:
-                            href = urljoin(base_url, href_raw).split('#')[0].split('?')[0]
-                            if _is_chapter_href(href):
-                                # 标题统一使用 get_text，避免属性类型导致解析失败
-                                title = _normalize_title(_clean_text(a.get_text(" ", strip=True)))
-                                latest_chapters.append({"title": title or None, "url": href})
+                        e = _entry_from_anchor(a, base_url)
+                        if e:
+                            latest_chapters.append(e)
 
     # 优先返回正文卷，如果没有正文卷则返回最新章节（但需要反转顺序）
     if main_chapters:
@@ -388,8 +645,104 @@ def _extract_from_dl_structure(dl_elements, base_url):
         # 最新章节通常是倒序的，需要反转
         return list(reversed(latest_chapters))
 
-    return []
+    # 兜底：部分站点仅有 div#list 下的单一 dl，dt 文字不含“正文/最新”，但 dd 里全是章节
+    try:
+        collected = []
+        for dl in dl_elements:
+            # 限定在 #list 下的 dl 优先
+            parent = getattr(dl, "parent", None)
+            in_list = False
+            while parent is not None:
+                if getattr(parent, "get", None) and parent.get("id") == "list":
+                    in_list = True
+                    break
+                parent = getattr(parent, "parent", None)
+            # 收集 dd>a
+            dd_links = dl.find_all("dd")
+            for dd in dd_links:
+                a = dd.find("a", href=True)
+                if not a:
+                    continue
+                e = _entry_from_anchor(a, base_url)
+                if e:
+                    collected.append(e)
+            # 如果在 #list 下且已收集到一定数量，认为是章节列表
+            if in_list and len(collected) >= 5:
+                return collected
+        # 若未命中 #list 优先，也可在全局 dl 里判断数量充足时作为弱兜底
+        if len(collected) >= 20:
+            return collected
+    except Exception:
+        pass
 
+    return [] 
+
+
+def _extract_entries_from_paged_html(index_html: str, base_url: str):
+    """
+    从分页目录页中提取章节条目（仅限章节容器范围），避免误采导航。
+    优先 div#list 下的 dl/dd/a；次选 ul.chapter 下的 a。
+    """
+    try:
+        soup = _bs(index_html)
+        entries = []
+
+        # 优先：精准提取“正文”对应的 ul.chapter，避免混入“最新章节预览”
+        try:
+            intros = soup.find_all("div", class_="intro")
+            target_ul = None
+            for intro in intros:
+                try:
+                    if intro.get_text(strip=True) == "正文":
+                        sib = intro
+                        while sib is not None:
+                            sib = getattr(sib, "next_sibling", None)
+                            if not getattr(sib, "name", None):
+                                continue
+                            if sib.name == "ul" and "chapter" in (sib.get("class") or []):
+                                target_ul = sib
+                                break
+                        if target_ul:
+                            break
+                except Exception:
+                    continue
+            if target_ul:
+                for a in target_ul.find_all("a", href=True):
+                    e = _entry_from_anchor(a, base_url)
+                    if e:
+                        entries.append(e)
+                if entries:
+                    return entries
+        except Exception:
+            pass
+
+        # 1) 优先 #list dl 结构
+        try:
+            dl_in_list = soup.select_one("#list dl")
+        except Exception:
+            dl_in_list = None
+        if dl_in_list:
+            dd_links = getattr(dl_in_list, "find_all", lambda *_: [])("dd")
+            for dd in dd_links:
+                a = dd.find("a", href=True)
+                if not a:
+                    continue
+                e = _entry_from_anchor(a, base_url)
+                if e:
+                    entries.append(e)
+            if entries:
+                return entries
+
+        # 2) 次选 ul.chapter
+        uls = soup.find_all("ul", class_="chapter")
+        for u in uls or []:
+            for a in u.find_all("a", href=True):
+                e = _entry_from_anchor(a, base_url)
+                if e:
+                    entries.append(e)
+        return entries
+    except Exception:
+        return []
 
 def _supplement_entries_from_ul(entries, ul_el, base_url):
     """从指定的章节UL源码中补齐遗漏的<a>锚点，仅在该UL范围内扫描，避免全页慢扫描"""
@@ -399,10 +752,10 @@ def _supplement_entries_from_ul(entries, ul_el, base_url):
         existing = {e["url"] for e in entries}
         ul_html = str(ul_el)
         # 受限正则：只在该UL源码中匹配锚点
-        for m in re.finditer(r'<a\\s+[^>]*href="(\\d+\\.html)"[^>]*>([^<]+)</a>', ul_html, flags=re.IGNORECASE):
+        for m in _RE_ANCHOR_IN_UL.finditer(ul_html):
             href_rel = m.group(1)
             title_text = _normalize_title(_clean_text(m.group(2)))
-            url_abs = urljoin(base_url, href_rel).split('#')[0].split('?')[0]
+            url_abs = _abs_url(base_url, href_rel)
             if _is_chapter_href(url_abs) and url_abs not in existing:
                 entries.append({"title": title_text or None, "url": url_abs})
                 existing.add(url_abs)
@@ -439,9 +792,6 @@ def _finalize_entries(entries):
         title = _normalize_title(e.get("title") or (f"第{i}章" if chapnum is None else f"第{chapnum}章"))
         final.append({"index": i, "title": title, "url": url, "chapter_num": chapnum})
 
-    # 仅按页面抓取顺序返回，避免标题中的异常数字导致排序错乱
-    for i, e in enumerate(final, start=1):
-        e["index"] = i
     return final
 
 
@@ -456,7 +806,7 @@ def extract_title_and_content_from_chapter(html, base_url=None):
     返回:
         tuple: (标题, 内容, 段落列表)
     """
-    soup = BeautifulSoup(html, "lxml")
+    soup = _bs(html)
     title = ""
     h1_el = soup.find("h1")
     if h1_el and hasattr(h1_el, "get_text"):
@@ -615,7 +965,7 @@ def extract_book_title_from_html(html):
         str: 提取的书籍标题，如果无法提取则返回空字符串
     """
     try:
-        soup = BeautifulSoup(html, "lxml")
+        soup = _bs(html)
         if soup.title and soup.title.string:
             title = soup.title.string.strip().split("-")[0].strip()
             return title
@@ -676,6 +1026,16 @@ class IndexFetchThread(QThread):
         try:
             self.progress.emit("请求目录页…")
             html = fetch_html(self.url)
+            # 适配：部分站点（如 m.syvvw.cc）详情页不含完整目录，尝试跳转到 /book/{id}.html
+            alt_url = _locate_full_chapter_index(self.url, html)
+            if alt_url and alt_url != self.url:
+                try:
+                    self.progress.emit("发现完整目录页，跳转解析…")
+                    html = fetch_html(alt_url)
+                    self.url = alt_url
+                except Exception:
+                    # 跳转失败不影响后续解析
+                    pass
             self.progress.emit("解析目录…")
             
             # 使用流式处理来避免内存峰值
@@ -690,12 +1050,17 @@ class IndexFetchThread(QThread):
     def _extract_chapters_with_memory_optimization(self, html, base_url):
         """内存优化的章节提取方法"""
         try:
+            # 针对存在目录分页的站点（tbxsvv/tbxsw/syvvw），强制走标准解析以覆盖所有分页
+            host = (urlparse(base_url).netloc or "").lower()
+            if ("tbxsvv.cc" in host) or ("tbxsw.cc" in host) or ("syvvw.cc" in host):
+                return extract_chapter_list_from_index_precise_fixed(html, base_url)
+
             # 首先快速估算章节数量
             self.progress.emit("估算章节数量…")
             estimated_count = self._estimate_chapter_count(html)
             
             if estimated_count > 3000:
-                # 对于大量章节，使用分批处理
+                # 对于大量章节，使用分批处理（仅在无分页站点使用）
                 self.progress.emit(f"检测到大量章节({estimated_count}+)，使用内存优化模式…")
                 return self._extract_chapters_in_batches(html, base_url, estimated_count)
             else:
@@ -724,7 +1089,7 @@ class IndexFetchThread(QThread):
             self.progress.emit("开始分批解析章节…")
             
             # 使用更轻量的解析方式
-            soup = BeautifulSoup(html, "lxml")
+            soup = _bs(html)
             
             # 找到章节容器
             chapter_container = self._find_chapter_container(soup)
@@ -752,7 +1117,7 @@ class IndexFetchThread(QThread):
                         continue
                         
                     # 构建完整URL
-                    full_url = urljoin(base_url, href).split('#')[0].split('?')[0]
+                    full_url = _abs_url(base_url, href)
                     
                     # 检查是否为章节链接
                     if not self._is_valid_chapter_url(full_url):
@@ -809,44 +1174,36 @@ class IndexFetchThread(QThread):
 
     def _find_chapter_container(self, soup):
         """查找章节容器"""
-        # 尝试多种方式找到章节容器
+        # 部分站点为 div#list <dl> 结构，优先识别
+        try:
+            dl_in_list = soup.select_one("#list dl")
+            if dl_in_list and dl_in_list.find_all("a", href=True):
+                return dl_in_list
+        except Exception:
+            pass
+
+        # 常见容器集合
         containers = [
             soup.find(id="allChapters2"),
             soup.find(id="allChapters"),
             soup.find("ul", class_="chapter"),
             soup.find("div", class_="listmain"),
-            soup.find("div", id="list")
+            soup.find("div", id="list"),
         ]
-        
         for container in containers:
             if container and container.find_all("a", href=True):
                 return container
-        
+
         # 如果都找不到，返回整个文档
         return soup
 
     def _is_valid_chapter_url(self, url):
-        """检查是否为有效的章节URL"""
-        # 必须是.html结尾
-        if not url.lower().endswith('.html'):
-            return False
-            
-        # 排除导航链接
-        path = urlparse(url).path or ""
-        nav_patterns = ['/sort/', '/author/', '/fullbook/', '/mybook', '/cover/', '/index']
-        for pattern in nav_patterns:
-            if pattern in path.lower():
-                return False
-                
-        return True
+        """检查是否为有效的章节URL（复用全局判定）"""
+        return _is_chapter_href(url) and not _is_nav_path(url)
 
     def _clean_title(self, title):
-        """清理章节标题"""
-        if not title:
-            return ""
-        # 移除多余空白
-        title = re.sub(r'\s+', ' ', title.strip())
-        return title
+        """清理章节标题（复用全局清洗与归一化）"""
+        return _normalize_title(_clean_text(title))
 
 
 # Chapter fetch thread
@@ -876,7 +1233,6 @@ class ChapterFetchThread(QThread):
     def run(self):
         """
         线程运行函数
-
         获取章节内容，如果缓存存在则从缓存读取，否则从网络获取并缓存
         """
         try:
@@ -914,3 +1270,4 @@ __all__ = [
     "IndexFetchThread",
     "ChapterFetchThread"
 ]
+
