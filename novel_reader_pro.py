@@ -1,8 +1,10 @@
+__version__ = "1.0.1"
 import sys
-import json
+
 import re
 import time
 import shutil
+import logging
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -11,19 +13,17 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QSpinBox, QCheckBox,
     QInputDialog, QToolBar, QStatusBar, QProgressDialog
 )
-from PySide6.QtGui import QFont, QAction
-from PySide6.QtCore import Qt, QTimer, Signal, QThread
-
+from PySide6.QtGui import QFont, QAction, QTextOption
+from PySide6.QtCore import Qt, QTimer, Signal
+from runlog import setup_app_logger
 from analysis_index import (
     fetch_html, 
-    extract_chapter_list_from_index_precise_fixed,
-    extract_title_and_content_from_chapter,
     load_json,
     save_json,
     extract_book_title_from_html,
     process_chapter_content_for_display,
     create_book_directory_and_debug,
-    generate_book_id_from_url,
+
     create_book_metadata,
     IndexFetchThread,
     ChapterFetchThread
@@ -42,11 +42,19 @@ else:
     except NameError:
         SCRIPT_DIR = Path.cwd()
 
-APP_DIR = SCRIPT_DIR / ".pyside_novel_reader_reader_fixed"  # 应用数据目录
+APP_DIR = SCRIPT_DIR / "data"  # 应用数据目录
 
 APP_DIR.mkdir(parents=True, exist_ok=True)
+BOOKS_DIR = APP_DIR / "books"
+BOOKS_DIR.mkdir(parents=True, exist_ok=True)
+
 LIB_FILE = APP_DIR / "library.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
+
+setup_app_logger(str(APP_DIR / "app.log") ,add_console=True) #是否开启控制台日志输出
+logging.info("应用启动")
+# English: Application started
+# logging.info("Application started")
 
 DEFAULT_SETTINGS = {
     "font_family": "方正启体简体",
@@ -153,9 +161,6 @@ class GestureTextBrowser(QTextBrowser):
         except Exception:
             super().wheelEvent(event)
 
-
-
-# GUI main window (kept behavior and UI from previous final)
 class NovelReaderSidebarFixed(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -166,6 +171,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.current_book_id = None
         self.current_chapters = []
         self.current_book_dir = None
+        self.chapter_by_idx = {}
         self.fetch_thread = None
         self.index_thread = None
         self.progress_dialog = None
@@ -231,6 +237,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         left_col.addWidget(self.chapter_label)
         self.chapter_list = QListWidget()
         self.chapter_list.setUniformItemSizes(True)
+        self.chapter_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
         self.chapter_list.itemActivated.connect(self.on_chapter_clicked)
         left_col.addWidget(self.chapter_list, 1)
 
@@ -257,6 +264,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.base_font = QFont(self.settings.get("font_family", "方正启体简体"), self.settings.get("font_size", 22))
         self.text_browser.setFont(self.base_font)
         self.text_browser.setOpenExternalLinks(True)
+        self.text_browser.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
         # 连接手势信号
         self.text_browser.prev_chapter_requested.connect(self.go_to_prev_chapter)
         self.text_browser.next_chapter_requested.connect(self.go_to_next_chapter)
@@ -276,6 +284,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.next_btn.setEnabled(False)
         nav_row.addWidget(self.next_btn)
         right_col.addLayout(nav_row)
+        
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         h.addLayout(right_col, 8)  
@@ -284,6 +293,10 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.save_timer.setInterval(3000)
         self.save_timer.timeout.connect(self._auto_save)
         self.save_timer.start()
+        self._settings_dirty = False
+        self._library_dirty = False
+        self._fetching = False
+        self._current_raw_content = None
 
         tb = QToolBar("工具")
         self.addToolBar(tb)
@@ -295,16 +308,27 @@ class NovelReaderSidebarFixed(QMainWindow):
         
     def closeEvent(self, event):
         """程序关闭时清理资源"""
-        # 清理章节获取线程
-        if self.fetch_thread and self.fetch_thread.isRunning():
-            self.fetch_thread.terminate()
-            self.fetch_thread.wait()
+        # 清理章节获取线程（优雅退出）
+        try:
+            t = self.fetch_thread
+            if t and t.isRunning():
+                t.requestInterruption()
+                t.quit()
+                t.wait()
+        except Exception:
+            pass
         
-        # 清理目录获取线程
+        # 清理目录获取线程（优雅退出，兼容自定义 stop）
         if self.index_thread and self.index_thread.isRunning():
-            self.index_thread.stop()  
-            self.index_thread.terminate()
-            self.index_thread.wait()
+            try:
+                if hasattr(self.index_thread, "stop"):
+                    self.index_thread.stop()  
+                if hasattr(self.index_thread, "requestInterruption"):
+                    self.index_thread.requestInterruption()
+                self.index_thread.quit()
+                self.index_thread.wait()
+            except Exception:
+                pass
         
         # 清理进度弹窗
         if hasattr(self, 'progress_dialog') and self.progress_dialog:
@@ -334,6 +358,9 @@ class NovelReaderSidebarFixed(QMainWindow):
         if ok2 != QMessageBox.StandardButton.Yes:
             return
         # 启动异步导入
+        logging.info(f"请求导入书籍: url='{url}'")
+        # English: request to import book
+        # logging.info(f"import book requested: url='{url}'")
         self._start_index_fetch(url, "正在导入目录…", "正在导入", 
                                lambda chapters, error: self._handle_index_fetch_result(chapters, error, is_import=True, url=url))
 
@@ -373,6 +400,9 @@ class NovelReaderSidebarFixed(QMainWindow):
         
         # 显示进度弹窗
         self._show_progress_dialog(dialog_message, dialog_title)
+        logging.info(f"开始获取目录: url='{url}'")
+        # English: index fetch start
+        # logging.info(f"index fetch start: url='{url}'")
         self.index_thread.start()
 
     def _handle_index_fetch_result(self, chapters, error, is_import=False, url=None):
@@ -419,6 +449,8 @@ class NovelReaderSidebarFixed(QMainWindow):
         
         # 创建书籍元数据
         bid, meta = create_book_metadata(url, chapters, soup_title)
+        # 将书籍缓存统一放到应用数据目录下的 books 文件夹
+        meta["book_dir"] = str((BOOKS_DIR / bid).resolve())
         
         # 创建目录并保存调试文件
         create_book_directory_and_debug(meta, chapters)
@@ -428,19 +460,28 @@ class NovelReaderSidebarFixed(QMainWindow):
         save_json(LIB_FILE, self.library)
         self.refresh_book_select_list()
         
-        QMessageBox.information(self, "导入成功", 
-                               f"已导入书籍：{meta['title']}（共 {len(chapters)} 章）")
+        logging.info(f"导入成功: bid={bid}, 标题='{meta.get('title','')}', 章节数={len(chapters)}")
+        # English: import success
+        # logging.info(f"import success: bid={bid}, title='{meta.get('title','')}', chapters={len(chapters)}")
+        QMessageBox.information(self, "导入成功",f"已导入书籍：{meta['title']}（共 {len(chapters)} 章）")
 
     def _handle_refresh_success(self, chapters):
         """处理刷新成功"""
         meta = self.library[self.current_book_id]
         meta["chapters"] = chapters
-        meta["chapter_index"] = 0
+        prev_idx = meta.get("chapter_index", 0)
+        if 0 <= prev_idx < len(chapters):
+            meta["chapter_index"] = prev_idx
+        else:
+            meta["chapter_index"] = 0
         
         # 保存并更新调试文件
         save_json(LIB_FILE, self.library)
         create_book_directory_and_debug(meta, chapters)
         
+        logging.info(f"目录刷新成功: bid={self.current_book_id}, 章节数={len(chapters)}")
+        # English: index refresh success
+        # logging.info(f"index refresh success: bid={self.current_book_id}, chapters={len(chapters)}")
         # 重新打开书籍
         self.open_book(self.current_book_id)
         QMessageBox.information(self, "完成", f"目录已刷新，共 {len(chapters)} 章")
@@ -458,15 +499,34 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.title_label.setText(meta.get("title", "未命名书"))
         self.current_chapters = meta.get("chapters", [])
         self.current_book_dir = Path(meta.get("book_dir"))
+        self._build_chapter_index_map()
         
+        logging.info(f"打开书籍: bid={bid}, 章节数={len(self.current_chapters)}")
+        # English: open book
+        # logging.info(f"open_book: bid={bid}, chapters={len(self.current_chapters)}")
         # 优化大量章节的处理
         self._populate_chapter_list_optimized()
         
         self.text_browser.clear()
         self.text_browser.setHtml("<i>点击左侧章节条目以加载并查看该章节内容（按需抓取并缓存）。</i>")
         self.update_navigation_buttons()
+        # 自动定位并加载上次阅读的章节（若存在）
+        idx = meta.get("chapter_index", 0)
+        if self.current_chapters and 0 <= idx < len(self.current_chapters):
+            self.load_chapter_by_index(idx)
 
 
+
+    def _build_chapter_index_map(self):
+        """构建章节索引到章节数据的映射，便于快速查找"""
+        try:
+            self.chapter_by_idx = {
+                ch.get('index'): ch
+                for ch in self.current_chapters
+                if isinstance(ch, dict) and 'index' in ch
+            }
+        except Exception:
+            self.chapter_by_idx = {}
 
     def search_chapter(self):
         q = self.chapter_search.text().strip()
@@ -484,10 +544,12 @@ class NovelReaderSidebarFixed(QMainWindow):
             return
         except Exception:
             pass
+        # 大小写不敏感搜索
+        q_lower = q.lower()
         matches = []
         for i in range(self.chapter_list.count()):
             it = self.chapter_list.item(i)
-            if q in it.text():
+            if q_lower in (it.text() or "").lower():
                 matches.append(it)
         if not matches:
             QMessageBox.information(self, "未找到", "未找到匹配章节")
@@ -500,23 +562,26 @@ class NovelReaderSidebarFixed(QMainWindow):
         chapter_index = item.data(Qt.UserRole)
         if chapter_index is None:
             return
+        # 抓取进行中则忽略新的点击，避免并发
+        if getattr(self, "_fetching", False):
+            return
         
-        # 根据索引查找完整的章节数据
-        chapter_data = None
-        for ch in self.current_chapters:
-            if ch.get('index') == chapter_index:
-                chapter_data = ch
-                break
-        
+        # 根据索引查找完整的章节数据（使用映射避免线性遍历）
+        chapter_data = self.chapter_by_idx.get(chapter_index)
         if chapter_data:
             self.load_chapter_content(chapter_data)
 
     def load_chapter_content(self, chapter_data):
         """加载章节内容的通用方法"""
-        # 停止并清理之前的线程
-        if self.fetch_thread and self.fetch_thread.isRunning():
-            self.fetch_thread.terminate()
-            self.fetch_thread.wait()
+        # 停止并清理之前的线程（优雅退出）
+        try:
+            t = self.fetch_thread
+            if t and t.isRunning():
+                t.requestInterruption()
+                t.quit()
+                t.wait()
+        except Exception:
+            pass
         
         # 清理旧的线程对象
         if self.fetch_thread:
@@ -538,11 +603,20 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.fetch_thread = ChapterFetchThread(url, idx, cache_dir)
         self.fetch_thread.progress.connect(lambda s: self.status.showMessage(s, 5000))
         self.fetch_thread.finished.connect(self.on_chapter_fetched)
+        self.fetch_thread.finished.connect(self._cleanup_fetch_thread)
+        self._fetching = True
+        logging.info(f"开始抓取章节: index={idx}, url='{url}'")
+        # English: chapter fetch start
+        # logging.info(f"chapter fetch start: index={idx}, url='{url}'")
         self.fetch_thread.start()
 
     def on_chapter_fetched(self, index, data, error):
         if error:
             QMessageBox.warning(self, "抓取失败", f"第 {index} 章抓取失败：{error}")
+            logging.info(f"抓取章节失败: index={index}, error={error}")
+            # English: chapter fetch failed
+            # logging.info(f"chapter fetch failed: index={index}, error={error}")
+            self._fetching = False
             return
         title = data.get("title") or f"第{index}章"
         content = data.get("content") or ""
@@ -559,10 +633,25 @@ class NovelReaderSidebarFixed(QMainWindow):
         )
         
         self.text_browser.setHtml(html)
+        self._current_raw_content = content
         self.library[self.current_book_id]["chapter_index"] = index - 1
-        save_json(LIB_FILE, self.library)
+        self._library_dirty = True
+        self._fetching = False
         self.status.showMessage(f"已加载第 {index} 章", 4000)
+        logging.info(f"章节加载完成: index={index}, 标题='{title}'")
+        # English: chapter loaded
+        # logging.info(f"chapter loaded: index={index}, title='{title}'")
         self.update_navigation_buttons()
+
+    def _cleanup_fetch_thread(self, *args):
+        """线程完成后的安全清理：避免访问已删除的 C++ 对象"""
+        try:
+            t = self.fetch_thread
+            self.fetch_thread = None
+            if t:
+                t.deleteLater()
+        except Exception:
+            pass
 
     def update_navigation_buttons(self):
         """更新导航按钮状态和章节信息"""
@@ -640,18 +729,36 @@ class NovelReaderSidebarFixed(QMainWindow):
 
     def change_font_size(self, v):
         self.settings["font_size"] = v
-        save_json(SETTINGS_FILE, self.settings)
+        self._settings_dirty = True
         self.base_font.setPointSize(v)
         self.text_browser.setFont(self.base_font)
-        # 重新渲染当前内容
-        if self.text_browser.toHtml():
-            current_html = self.text_browser.toHtml()
-            self.text_browser.setHtml(current_html)
+        # 重新渲染当前内容（使用原始文本，保持一致性）
+        if getattr(self, "_current_raw_content", None) is not None:
+            html = process_chapter_content_for_display(
+                self._current_raw_content,
+                self.settings.get("font_family", DEFAULT_SETTINGS["font_family"]),
+                self.settings.get("font_size", 22),
+                self.settings.get("line_height", 1.6),
+                self.settings.get("night_mode", False),
+                self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
+            )
+            self.text_browser.setHtml(html)
 
     def toggle_night_mode(self, on):
         self.settings["night_mode"] = on
-        save_json(SETTINGS_FILE, self.settings)
+        self._settings_dirty = True
         self.apply_night_mode(on)
+        # 夜间模式切换后，基于原始文本重新渲染以保持一致性
+        if getattr(self, "_current_raw_content", None) is not None:
+            html = process_chapter_content_for_display(
+                self._current_raw_content,
+                self.settings.get("font_family", DEFAULT_SETTINGS["font_family"]),
+                self.settings.get("font_size", 22),
+                self.settings.get("line_height", 1.6),
+                self.settings.get("night_mode", False),
+                self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
+            )
+            self.text_browser.setHtml(html)
 
     def apply_night_mode(self, on):
         if on:
@@ -678,6 +785,9 @@ class NovelReaderSidebarFixed(QMainWindow):
         if reply == QMessageBox.StandardButton.No:
             return
 
+        logging.info(f"请求删除书籍: bid={bid}, 标题='{meta.get('title','未知书籍')}'")
+        # English: remove book requested
+        # logging.info(f"remove book requested: bid={bid}, title='{meta.get('title','未知书籍')}'")
         # 删除书籍缓存目录
         book_dir_path = Path(meta.get("book_dir"))
         if book_dir_path.exists() and book_dir_path.is_dir():
@@ -704,6 +814,9 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.title_label.setText("未打开书")
             self.update_navigation_buttons()
         
+        logging.info(f"书籍已删除: bid={bid}, 标题='{meta.get('title','未知书籍')}'")
+        # English: book removed
+        # logging.info(f"book removed: bid={bid}, title='{meta.get('title','未知书籍')}'")
         QMessageBox.information(self, "删除成功", "书籍已成功删除")
 
     def _show_progress_dialog(self, message, title):
@@ -714,7 +827,7 @@ class NovelReaderSidebarFixed(QMainWindow):
             
             self.progress_dialog = QProgressDialog(message, "", 0, 0, self)
             self.progress_dialog.setWindowTitle(title)
-            self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            self.progress_dialog.setWindowModality(Qt.WindowModality.NonModal)
             self.progress_dialog.setCancelButton(None)
             self.progress_dialog.setAutoClose(False)
             self.progress_dialog.setAutoReset(False)
@@ -795,10 +908,17 @@ class NovelReaderSidebarFixed(QMainWindow):
     def _auto_save(self):
         """自动保存设置和库"""
         try:
-            save_json(SETTINGS_FILE, self.settings)
-            save_json(LIB_FILE, self.library)
+            if getattr(self, "_settings_dirty", False):
+                save_json(SETTINGS_FILE, self.settings)
+                self._settings_dirty = False
+            if getattr(self, "_library_dirty", False):
+                save_json(LIB_FILE, self.library)
+                self._library_dirty = False
+                logging.info("library.json 已保存")
+                # English: library.json saved
+                # logging.info("library.json saved")
         except Exception:
-            pass
+            logging.exception("自动保存失败")
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # 使用Fusion风格，在所有平台上看起来一致
