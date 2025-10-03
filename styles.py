@@ -248,3 +248,47 @@ QToolBar {
     spacing: 3px; /* 间距 */
 }
 """
+
+# 直排排版 HTML 包装函数（与主程序一致）
+def wrap_vertical_html(inner_html, font_family, font_size, line_height, night, text_color, bg_color=None):
+    """
+    生成包含直排 CSS 的完整 HTML。
+    参数：
+      - inner_html: 已生成的章节 HTML 片段
+      - font_family: 字体
+      - font_size: 字号（px）
+      - line_height: 行高
+      - night: 是否夜间模式（决定深色背景）
+      - text_color: 文本颜色
+      - bg_color: 背景色（可选；白天模式下优先使用该色）
+    """
+    if bg_color is None:
+        bg = "#121212" if night else "#ffffff"
+    else:
+        bg = "#121212" if night else bg_color
+    return f"""<!doctype html>
+<meta charset="utf-8">
+<style>
+  html,body {{
+    margin:0; height:100%; background:{bg}; color:{text_color};
+  }}
+  .vwrap {{
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    font-feature-settings: "vert" 1, "vrt2" 1;
+    font-family: "{font_family}", "Noto Serif CJK SC", "Source Han Serif SC", serif;
+    font-size: {font_size}px;
+    line-height: {line_height};
+    padding: 12px 16px;
+    /* 减少标点贴近问题与更自然断行 */
+    letter-spacing: 0.02em;
+    line-break: strict;
+    word-break: keep-all;
+    overflow-wrap: anywhere;
+    hanging-punctuation: allow-end;
+    text-rendering: optimizeLegibility;
+    scroll-behavior: smooth;
+  }}
+  a {{ color: {text_color}; text-decoration: underline; }}
+</style>
+<div class="vwrap">{inner_html}</div>"""
