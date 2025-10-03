@@ -1421,23 +1421,3 @@ __all__ = [
     "IndexFetchThread",
     "ChapterFetchThread"
 ]
-
-
-
-#TODO:
-
-# 合并一些相似的解析逻辑，避免解析逻辑重复，
-# 寻找更多的小说站，尤其是高流量的站，分析其章节列表的特征，
-# 确定是否需要调整解析逻辑，以提高解析效率。
-"""需要爬取的其他网站如下
-可搜索：http://www.xbiqugu.la/modules/article/waps.php，searchkey参数，
-
-#其余的
-https://www.biqivge.com/book/32558/
-https://www.tbxsw.cc/html/0/id746/
-
-https://www.dldwx.cc/xs/166361/
-https://m.syvvw.cc/1/1194/
-http://www.xbiqugu.la/142/142920/
-https://m.syvvw.cc/book/1194.html
-"""
