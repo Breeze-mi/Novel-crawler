@@ -1,14 +1,9 @@
-'''
- # analysis_index.py
- # 组件：负责从网站获取并解析小说信息、章节目录和章节内容
- # 版权所有：2025 Breeze-mi
- # 日期：2025/09/28
-'''
 import re
 import time
 import json
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from typing import Any, Optional, Dict, List, Tuple, Set, TYPE_CHECKING
 
 # 预编译常用正则，降低重复编译开销
 _RE_NUM_HTML_TAIL = re.compile(r'(\d+)\.html$', re.IGNORECASE)
@@ -18,6 +13,107 @@ _RE_TITLE_CHAPNUM = re.compile(r'第\s*([0-9０-９零〇一二三四五六七�
 _RE_NAV_PATH = re.compile(r'/sort/|/author/|/fullbook/|/mybook|/cover/|/index|/class\\d+-|/quanben|/top|/dll|/user/', re.IGNORECASE)
 # 分页页匹配（常见于目录分页，如 index_2.html / list_2.html）
 _RE_PAGINATION = re.compile(r'(?:^|/)(?:index|list)_(\d+)\.html$', re.IGNORECASE)
+
+# 站点规则表与工具
+RULES: Dict[str, Dict[str, Any]] = {
+    # 笔趣类（示例）
+    "biqu": {
+        "chapter_selectors": ["#list dl dd a", "ul.chapter a", "div.listmain a"],
+        "skip_containers": [".recommend", ".intro .latest"],
+        "next_selectors": [
+            'a[rel="next"]',
+            'a[aria-label*="下一页"]',
+            'a:contains("下一页"), a:contains("下页"), a:contains("›")',
+        ],
+        "title_replace": {"最新章节": "", "手机阅读": ""},
+    },
+    # tbxsw / tbxsvv（示例）
+    "tbxsw": {
+        "chapter_selectors": ["#list dl dd a", ".chapter-list a", "ul.chapter a", "div.listmain a"],
+        "skip_containers": [".rec", ".ad", ".latest"],
+        "next_selectors": ['a[rel="next"]', 'a:contains("下一页")', 'a:contains("下页")'],
+        "title_replace": {},
+    },
+    # syvvw（示例）
+    "syvvw": {
+        "chapter_selectors": ["#list dl dd a", "ul.chapter a", "div.listmain a"],
+        "skip_containers": [".recommend", ".new-update"],
+        "next_selectors": ['a[rel="next"]', 'a:contains("下页")', 'a:contains("下一页")'],
+        "title_replace": {},
+    },
+}
+# 网站规则表
+#新增站点名，从URL中获取。
+def _site_key(netloc: str) -> str:
+    host = (netloc or "").lower()
+    if not host:
+        return ""
+    if "tbxsw" in host or "tbxsvv" in host:
+        return "tbxsw"
+    if "syvvw" in host:
+        return "syvvw"
+    if "biqu" in host or "bq" in host:
+        return "biqu"
+    return ""
+
+# URL 规范化与编号提取扩展
+_URL_ID_PATTERNS = [
+    re.compile(r"[^\d](\d{1,7})\.html$", re.I),
+    re.compile(r"/(\d{1,7})(?:/|\.html|$)", re.I),
+    re.compile(r"[_\-](\d{1,7})(?:\.html|/|$)", re.I),
+    re.compile(r"/chapter/(\d{1,7})(?:/|\.html|$)", re.I),
+]
+def _normalize_canonical_url(u: str) -> str:
+    if not u:
+        return ""
+    p = urlparse(u)
+    scheme = (p.scheme or "http").lower()
+    host = (p.hostname or "").lower()
+    netloc = host
+    if p.port and not ((scheme == "http" and p.port == 80) or (scheme == "https" and p.port == 443)):
+        netloc = f"{host}:{p.port}"
+    path = p.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    return f"{scheme}://{netloc}{path}"
+def _extract_id_from_url(url: str):
+    s = url or ""
+    for pat in _URL_ID_PATTERNS:
+        m = pat.search(s)
+        if m:
+            try:
+                n = int(m.group(1))
+                if n > 0:
+                    return n
+            except Exception:
+                pass
+    return None
+
+def _collect_next_urls_by_rules(soup, base_url: str, rules: Dict[str, Any]):
+    found = set()
+    sels = (rules or {}).get("next_selectors") or []
+    for sel in sels:
+        try:
+            for a in soup.select(sel):
+                href = (getattr(a, "get", lambda *_: "")("href") or "").strip()
+                if not href:
+                    continue
+                absu = _abs_url(base_url, href)
+                if absu and absu != base_url:
+                    found.add(absu)
+        except Exception:
+            continue
+    # 兜底：常见“下一页/下页/Next/›”文本
+    try:
+        for a in soup.find_all("a", href=True):
+            txt = (a.get_text(" ", strip=True) or "")
+            if any(k in txt for k in ("下一页","下页","Next","›")):
+                absu = _abs_url(base_url, a.get("href"))
+                if absu and absu != base_url:
+                    found.add(absu)
+    except Exception:
+        pass
+    return sorted(found)
 
 try:
     import requests
@@ -30,21 +126,23 @@ except Exception as e:
 try:
     from PySide6.QtCore import QThread, Signal
 except ImportError:
-    # 如果没有PySide6，定义一个简单的替代类
-    class QThread:
-        def __init__(self):
+    # 无 PySide6 环境：提供轻量桩类，避免类型检查/继承错误
+    class QThread:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
             pass
-
-    class Signal:
-        def __init__(self, *args):
-            self.callbacks = []
-
-        def connect(self, callback):
-            self.callbacks.append(callback)
-
-        def emit(self, *args):
-            for callback in self.callbacks:
-                callback(*args)
+        def start(self): pass
+        def run(self): pass
+        def quit(self): pass
+    class Signal:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            self._cbs = []
+        def connect(self, cb): self._cbs.append(cb)
+        def emit(self, *args, **kwargs):
+            for cb in list(self._cbs):
+                try:
+                    cb(*args, **kwargs)
+                except Exception:
+                    pass
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.125 Safari/537.36"
 HEADERS = {"User-Agent": USER_AGENT}
@@ -245,7 +343,7 @@ def _abs_url(base_url: str, href_raw: str) -> str:
     """将相对链接规范化为绝对URL，并去除 #/? 尾部碎片"""
     if not href_raw:
         return ""
-    return urljoin(base_url, href_raw).split('#')[0].split('?')[0]
+    return _normalize_canonical_url(urljoin(base_url, href_raw).split('#')[0].split('?')[0])
 
 def _is_nav_path(url: str) -> bool:
     """判定URL路径是否为站点导航类路径"""
@@ -334,6 +432,10 @@ def _parse_chapnum(t: str, u: str):
             return int(m3.group(1))
         except:
             pass
+    # 最终兜底：更广的 URL 编号提取
+    n4 = _extract_id_from_url(u or "")
+    if n4:
+        return n4
     return None
 
 
@@ -498,49 +600,77 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
     except Exception:
         pass
 
-    # 目录分页抓取与合并（如 index_2.html / list_2.html）- 优先下拉页码顺序遍历，未命中再回退 BFS
+    # 目录分页抓取与合并（规则优先 + 回退）
     try:
-        # 优先：从首页下拉列表收集全部分页，按页码升序遍历
-        pages = []
-        pages.append((1, base_url))  # 第1页
+        host = (urlparse(base_url).netloc or "").lower()
+        key = _site_key(host)
+        site_rules = RULES.get(key) if key else None
 
-        try:
-            options = soup.find_all("option")
-            for opt in options:
-                val = str(opt.get("value") or "").strip()
-                if not val:
-                    continue
-                absu = _abs_url(base_url, val)
-                m = _RE_PAGINATION.search((urlparse(absu).path or ""))
-                if m:
-                    idx = int(m.group(1))
-                    if idx >= 2:
-                        pages.append((idx, absu))
-            # 去重并按页码排序
-            seenp = set()
-            pages = sorted([(i, u) for i, u in pages if not (u in seenp or seenp.add(u))], key=lambda x: x[0])
-        except Exception:
-            pages = [(1, base_url)]
+        # 规则优先：沿 next_selectors 线性向后抓取，最多 6 页
+        pages = [(1, base_url)]
+        if site_rules:
+            MAXP = 6
+            seenp = {base_url}
+            cur_url = base_url
+            cur_soup = soup
+            for _ in range(MAXP - 1):
+                next_candidates = _collect_next_urls_by_rules(cur_soup, cur_url, site_rules)
+                next_url = ""
+                for u2 in next_candidates:
+                    if u2 not in seenp:
+                        next_url = u2
+                        break
+                if not next_url:
+                    break
+                seenp.add(next_url)
+                pages.append((len(pages) + 1, next_url))
+                # 抓取下一页以便继续寻找 next
+                try:
+                    time.sleep(0.25)
+                    cur_html = fetch_html(next_url)
+                    cur_soup = _bs(cur_html)
+                    cur_url = next_url
+                except Exception:
+                    break
 
-        # 若存在 index_2.html 之类分页，则严格按“正文”列表逐页采集（每页20条）
-        has_paged = any(i >= 2 for i, _ in pages)
-        if has_paged:
-            entries = []
+        # 若未命中规则分页，再尝试原有的下拉/正则分页收集
+        if len(pages) == 1:
+            try:
+                opts = soup.find_all("option")
+                for opt in opts:
+                    val = str(opt.get("value") or "").strip()
+                    if not val:
+                        continue
+                    absu = _abs_url(base_url, val)
+                    m = _RE_PAGINATION.search((urlparse(absu).path or ""))
+                    if m:
+                        idx = int(m.group(1))
+                        if idx >= 2:
+                            pages.append((idx, absu))
+                seenp = set()
+                pages = sorted([(i, u) for i, u in pages if not (u in seenp or seenp.add(u))], key=lambda x: x[0])
+            except Exception:
+                pages = [(1, base_url)]
+
+        # 执行逐页采集；若只有 1 页，保留 entries 不变；若多页，覆盖 entries
+        if any(i >= 2 for i, _ in pages):
+            merged = []
             for idx, purl in pages:
                 try:
                     p_html = index_html if idx == 1 else fetch_html(purl)
+                    time.sleep(0.25 if idx > 1 else 0.0)
                     page_entries = _extract_entries_from_paged_html(p_html, purl)
                     if page_entries:
-                        entries.extend(page_entries)
+                        merged.extend(page_entries)
                 except Exception:
                     continue
+            entries = merged
         else:
-            # 回退：使用原 BFS 方案发现其它分页
+            # 回退 BFS：发现 index_2.html 等更多分页（沿原逻辑）
             def collect_pagination_urls(soup_obj, current_url):
                 found = set()
                 cpath = (urlparse(current_url).path or "")
                 cdir = cpath[: cpath.rfind("/") + 1] if "/" in cpath else cpath
-
                 for a in soup_obj.find_all("a", href=True):
                     rel = (a.get("href") or "").strip()
                     if not rel:
@@ -553,7 +683,6 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
                         continue
                     if absu and absu != current_url:
                         found.add(absu)
-
                 for opt in soup_obj.find_all("option"):
                     val = str(opt.get("value") or "").strip()
                     if not val:
@@ -568,11 +697,10 @@ def extract_chapter_list_from_index_precise_fixed(index_html: str, base_url: str
                         found.add(absu)
                 return found
 
-            visited = set([base_url])
+            visited = {base_url}
             queue = list(collect_pagination_urls(soup, base_url))
             for u in queue:
                 visited.add(u)
-
             i = 0
             while i < len(queue):
                 purl = queue[i]
@@ -686,6 +814,29 @@ def _extract_entries_from_paged_html(index_html: str, base_url: str):
     try:
         soup = _bs(index_html)
         entries = []
+        # 站点规则：按 chapter_selectors 优先解析
+        try:
+            host = (urlparse(base_url).netloc or "").lower()
+            key = _site_key(host)
+            site_rules = RULES.get(key) if key else None
+        except Exception:
+            site_rules = None
+        if site_rules:
+            for sel in site_rules.get("chapter_selectors", []):
+                try:
+                    nodes = soup.select(sel)
+                    if not nodes:
+                        continue
+                    collected = []
+                    for node in nodes:
+                        for a in getattr(node, "find_all", lambda *_: [])("a", href=True):
+                            e = _entry_from_anchor(a, base_url)
+                            if e:
+                                collected.append(e)
+                    if collected:
+                        return collected
+                except Exception:
+                    continue
 
         # 优先：精准提取“正文”对应的 ul.chapter，避免混入“最新章节预览”
         try:
@@ -1271,3 +1422,22 @@ __all__ = [
     "ChapterFetchThread"
 ]
 
+
+
+#TODO:
+
+# 合并一些相似的解析逻辑，避免解析逻辑重复，
+# 寻找更多的小说站，尤其是高流量的站，分析其章节列表的特征，
+# 确定是否需要调整解析逻辑，以提高解析效率。
+"""需要爬取的其他网站如下
+可搜索：http://www.xbiqugu.la/modules/article/waps.php，searchkey参数，
+
+#其余的
+https://www.biqivge.com/book/32558/
+https://www.tbxsw.cc/html/0/id746/
+
+https://www.dldwx.cc/xs/166361/
+https://m.syvvw.cc/1/1194/
+http://www.xbiqugu.la/142/142920/
+https://m.syvvw.cc/book/1194.html
+"""

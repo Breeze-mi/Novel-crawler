@@ -15,6 +15,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QFont, QAction, QTextOption
 from PySide6.QtCore import Qt, QTimer, Signal
+# 可选引入：WebEngine 用于真·直排（writing-mode）
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    WEBENGINE_AVAILABLE = True
+except Exception:
+    WEBENGINE_AVAILABLE = False
 from runlog import setup_app_logger
 from analysis_index import (
     fetch_html, 
@@ -29,7 +35,7 @@ from analysis_index import (
     ChapterFetchThread
 )
 # 导入样式
-from styles import DARK_STYLE, LIGHT_STYLE
+from styles import DARK_STYLE, LIGHT_STYLE, wrap_vertical_html
 
 
 if getattr(sys, 'frozen', False):
@@ -62,7 +68,8 @@ DEFAULT_SETTINGS = {
     "night_mode": False,
     "line_height": 1.6,
     "text_color": "#800000",
-    "bg_color": "#D2B48C"
+    "bg_color": "#D2B48C",
+    "vertical_mode": False
 }
 
 library = load_json(LIB_FILE, {})
@@ -77,14 +84,14 @@ class GestureTextBrowser(QTextBrowser):
     def __init__(self, parent=None):
         super().__init__(parent)
         # 分离上下翻页阈值与对齐保护参数
-        self.prev_threshold = 340   # 顶部触发上一章更不敏感，避免误翻
+        self.prev_threshold = 1000   # 顶部触发上一章更不敏感，避免误翻
         self.next_threshold = 120   # 底部触发下一章更灵敏
-        self.small_scroll_ignore = 66  # 边缘小幅滚动直接消费，用于对齐保护
+        self.small_scroll_ignore = 90  # 边缘小幅滚动直接消费，用于对齐保护
         self.top_enter_time = 0     # 进入顶部的时间戳(ms)
         self.bottom_enter_time = 0  # 进入底部的时间戳(ms)
         self.accumulated_scroll = 0  # 累积滚轮值
         self.last_gesture_time = 0   # 记录上一次手势触发时间
-        self.gesture_cooldown = 700  # 冷却时间(毫秒)，稳定翻页
+        self.gesture_cooldown = 800  # 冷却时间(毫秒)，稳定翻页
         
     def wheelEvent(self, event):
         try:
@@ -160,6 +167,88 @@ class GestureTextBrowser(QTextBrowser):
             super().wheelEvent(event)
         except Exception:
             super().wheelEvent(event)
+
+# 直排专用 Web 视图：将鼠标滚轮纵向滚动转换为横向滚动，符合 vertical-rl 的阅读习惯
+if 'WEBENGINE_AVAILABLE' in globals() and WEBENGINE_AVAILABLE:
+    class VerticalWebView(QWebEngineView):
+        # 在竖排中使用滚轮切章所需的信号
+        prev_chapter_requested = Signal()
+        next_chapter_requested = Signal()
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            # 滚轮切章的冷却控制，避免误触发
+            self._gesture_cooldown_ms = 800
+            self._last_gesture_ts = 0
+            # 滚轮计数阈值：上一章需 6 次、下一章需 4 次
+            self._prev_ticks_needed = 6
+            self._next_ticks_needed = 4
+            self._prev_tick_counter = 0
+            self._next_tick_counter = 0
+
+        def wheelEvent(self, event):
+            try:
+                # 将纵向滚轮映射为水平滚动：向上滚轮 => 向右滚动（上一列），向下滚轮 => 向左滚动（下一列）
+                delta_y = event.angleDelta().y()
+                step = int(delta_y * 0.6)  # 已修正方向：下(负) -> 向左；上(正) -> 向右
+                # 先执行滚动
+                self.page().runJavaScript(f"window.scrollBy({{left: {step}, top: 0, behavior: 'auto'}});")
+
+                # 边缘检测 + 冷却判断（异步读取滚动位置）
+                import time as _t
+                now_ms = int(_t.monotonic() * 1000)
+                cooldown_active = (now_ms - self._last_gesture_ts) < self._gesture_cooldown_ms
+
+                def _edge_check_cb(res):
+                    # res 为 JSON 字符串，包含 x(滚动X), w(scrollWidth), cw(clientWidth)
+                    try:
+                        import json
+                        data = json.loads(res) if isinstance(res, str) else res
+                        x = int(data.get("x", 0))
+                        w = int(data.get("w", 0))
+                        cw = int(data.get("cw", 0))
+                        edge_tol = 2
+                        at_right = (x + cw) >= (w - edge_tol)
+                        at_left = x <= edge_tol
+                        nonlocal now_ms
+                        # 非对应边缘或方向时，重置对应计数
+                        if not at_right and delta_y > 0:
+                            self._prev_tick_counter = 0
+                        if not at_left and delta_y < 0:
+                            self._next_tick_counter = 0
+                        if cooldown_active:
+                            return
+                        # 在最右边且向上滚（向右）=> 累计到达阈值触发上一章
+                        if at_right and delta_y > 0:
+                            self._prev_tick_counter += 1
+                            self._next_tick_counter = 0
+                            if self._prev_tick_counter >= self._prev_ticks_needed:
+                                self.prev_chapter_requested.emit()
+                                self._last_gesture_ts = now_ms
+                                self._prev_tick_counter = 0
+                        # 在最左边且向下滚（向左）=> 累计到达阈值触发下一章
+                        elif at_left and delta_y < 0:
+                            self._next_tick_counter += 1
+                            self._prev_tick_counter = 0
+                            if self._next_tick_counter >= self._next_ticks_needed:
+                                self.next_chapter_requested.emit()
+                                self._last_gesture_ts = now_ms
+                                self._next_tick_counter = 0
+                    except Exception:
+                        pass
+
+                js_probe = """
+(() => {
+  const de = document.documentElement;
+  return JSON.stringify({x: de.scrollLeft, w: de.scrollWidth, cw: de.clientWidth});
+})()
+"""
+                self.page().runJavaScript(js_probe, _edge_check_cb)
+                event.accept()
+            except Exception:
+                super().wheelEvent(event)
+else:
+    VerticalWebView = None
 
 class NovelReaderSidebarFixed(QMainWindow):
     def __init__(self):
@@ -259,6 +348,12 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.night_cb.setChecked(self.settings.get("night_mode", False))
         self.night_cb.toggled.connect(self.toggle_night_mode)
         top_controls.addWidget(self.night_cb)
+
+        # 直排开关
+        self.vertical_cb = QCheckBox("直排")
+        self.vertical_cb.setChecked(self.settings.get("vertical_mode", False))
+        self.vertical_cb.toggled.connect(self.toggle_vertical_mode)
+        top_controls.addWidget(self.vertical_cb)
         right_col.addLayout(top_controls)
         self.text_browser = GestureTextBrowser()
         self.base_font = QFont(self.settings.get("font_family", "方正启体简体"), self.settings.get("font_size", 22))
@@ -269,6 +364,19 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.text_browser.prev_chapter_requested.connect(self.go_to_prev_chapter)
         self.text_browser.next_chapter_requested.connect(self.go_to_next_chapter)
         right_col.addWidget(self.text_browser, 10)
+
+        # WebEngine 视图（用于真·直排）
+        self.web_view = VerticalWebView() if 'WEBENGINE_AVAILABLE' in globals() and WEBENGINE_AVAILABLE and VerticalWebView else None
+        if self.web_view:
+            right_col.addWidget(self.web_view, 10)
+            self.web_view.setVisible(self.settings.get("vertical_mode", False))
+            # 直排视图滚轮切章：连接到主窗口的上一章/下一章
+            if hasattr(self.web_view, "prev_chapter_requested"):
+                self.web_view.prev_chapter_requested.connect(self.go_to_prev_chapter)
+            if hasattr(self.web_view, "next_chapter_requested"):
+                self.web_view.next_chapter_requested.connect(self.go_to_next_chapter)
+        # 初始模式下的可见性
+        self.text_browser.setVisible(not self.settings.get("vertical_mode", False) or not self.web_view)
         # 添加章节导航按钮
         nav_row = QHBoxLayout()
         self.prev_btn = QPushButton("← 上一章")
@@ -508,7 +616,9 @@ class NovelReaderSidebarFixed(QMainWindow):
         self._populate_chapter_list_optimized()
         
         self.text_browser.clear()
-        self.text_browser.setHtml("<i>点击左侧章节条目以加载并查看该章节内容（按需抓取并缓存）。</i>")
+        if getattr(self, 'web_view', None):
+            self.web_view.setHtml("")
+        self.render_html("<i>点击左侧章节条目以加载并查看该章节内容（按需抓取并缓存）。</i>")
         self.update_navigation_buttons()
         # 自动定位并加载上次阅读的章节（若存在）
         idx = meta.get("chapter_index", 0)
@@ -632,7 +742,7 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
         )
         
-        self.text_browser.setHtml(html)
+        self.render_html(html)
         self._current_raw_content = content
         self.library[self.current_book_id]["chapter_index"] = index - 1
         self._library_dirty = True
@@ -727,6 +837,58 @@ class NovelReaderSidebarFixed(QMainWindow):
 
 
 
+    # ========== 直排渲染相关 ==========
+
+
+    def render_html(self, html):
+        """按当前模式渲染 HTML 到合适的视图"""
+        vertical = self.settings.get("vertical_mode", False)
+        if vertical and getattr(self, 'web_view', None):
+            vhtml = wrap_vertical_html(
+                html,
+                self.settings.get("font_family", DEFAULT_SETTINGS["font_family"]),
+                self.settings.get("font_size", 22),
+                self.settings.get("line_height", 1.6),
+                self.settings.get("night_mode", False),
+                self.settings.get("text_color", DEFAULT_SETTINGS["text_color"]),
+                self.settings.get("bg_color", "#ffffff"),
+            )
+            self.web_view.setHtml(vhtml)
+            # 直排下默认定位到最右侧（文章开头）
+            try:
+                QTimer.singleShot(60, lambda: self.web_view.page().runJavaScript(
+                    "window.scrollTo({left: document.documentElement.scrollWidth, top: 0, behavior: 'auto'});"
+                ))
+            except Exception:
+                pass
+        else:
+            self.text_browser.setHtml(html)
+
+    def toggle_vertical_mode(self, on):
+        """切换直排模式"""
+        self.settings["vertical_mode"] = on
+        self._settings_dirty = True
+        if getattr(self, 'web_view', None):
+            self.web_view.setVisible(on)
+        # 无 WebEngine 时仍显示 QTextBrowser
+        self.text_browser.setVisible(not on or not getattr(self, 'web_view', None))
+        if on and not getattr(self, 'web_view', None):
+            QMessageBox.information(self, "直排不可用", "当前环境未检测到 WebEngine 组件，已继续使用横排显示。如需直排，请安装 PySide6（包含 QtWebEngine）后重启应用。")
+
+        # 重新渲染当前内容
+        if getattr(self, "_current_raw_content", None) is not None:
+            html = process_chapter_content_for_display(
+                self._current_raw_content,
+                self.settings.get("font_family", DEFAULT_SETTINGS["font_family"]),
+                self.settings.get("font_size", 22),
+                self.settings.get("line_height", 1.6),
+                self.settings.get("night_mode", False),
+                self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
+            )
+            self.render_html(html)
+        elif getattr(self, 'web_view', None) and on:
+            self.web_view.setHtml("")
+
     def change_font_size(self, v):
         self.settings["font_size"] = v
         self._settings_dirty = True
@@ -742,7 +904,7 @@ class NovelReaderSidebarFixed(QMainWindow):
                 self.settings.get("night_mode", False),
                 self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
             )
-            self.text_browser.setHtml(html)
+            self.render_html(html)
 
     def toggle_night_mode(self, on):
         self.settings["night_mode"] = on
@@ -758,7 +920,7 @@ class NovelReaderSidebarFixed(QMainWindow):
                 self.settings.get("night_mode", False),
                 self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
             )
-            self.text_browser.setHtml(html)
+            self.render_html(html)
 
     def apply_night_mode(self, on):
         if on:
