@@ -1,4 +1,4 @@
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 import sys
 
 import re
@@ -57,7 +57,7 @@ BOOKS_DIR.mkdir(parents=True, exist_ok=True)
 LIB_FILE = APP_DIR / "library.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
 
-setup_app_logger(str(APP_DIR / "app.log") ,add_console=True) #是否开启控制台日志输出
+setup_app_logger(str(APP_DIR / "app.log") ,add_console=False) #是否开启控制台日志输出
 logging.info("应用启动")
 # English: Application started
 # logging.info("Application started")
@@ -615,9 +615,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         # 优化大量章节的处理
         self._populate_chapter_list_optimized()
         
-        self.text_browser.clear()
-        if getattr(self, 'web_view', None):
-            self.web_view.setHtml("")
+        # 避免清空导致闪烁，直接渲染占位提示
         self.render_html("<i>点击左侧章节条目以加载并查看该章节内容（按需抓取并缓存）。</i>")
         self.update_navigation_buttons()
         # 自动定位并加载上次阅读的章节（若存在）
@@ -853,6 +851,7 @@ class NovelReaderSidebarFixed(QMainWindow):
                 self.settings.get("text_color", DEFAULT_SETTINGS["text_color"]),
                 self.settings.get("bg_color", "#ffffff"),
             )
+            # 避免空白过渡导致闪烁，直接渲染目标内容
             self.web_view.setHtml(vhtml)
             # 直排下默认定位到最右侧（文章开头）
             try:
@@ -862,7 +861,21 @@ class NovelReaderSidebarFixed(QMainWindow):
             except Exception:
                 pass
         else:
+            # 保留滚动位置，禁用更新后替换内容，避免闪烁
+            try:
+                sb = self.text_browser.verticalScrollBar()
+                pos = sb.value() if sb else 0
+            except Exception:
+                sb = None
+                pos = 0
+            self.text_browser.setUpdatesEnabled(False)
             self.text_browser.setHtml(html)
+            self.text_browser.setUpdatesEnabled(True)
+            try:
+                if sb:
+                    sb.setValue(pos)
+            except Exception:
+                pass
 
     def toggle_vertical_mode(self, on):
         """切换直排模式"""
@@ -923,12 +936,16 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.render_html(html)
 
     def apply_night_mode(self, on):
-        if on:
-            # 使用从styles.py导入的夜间模式样式
-            self.setStyleSheet(DARK_STYLE)
-        else:
-            # 使用从styles.py导入的浅色模式样式
-            self.setStyleSheet(LIGHT_STYLE)
+        # 切换样式前短暂禁用更新，减少整窗重绘引起的闪烁
+        try:
+            self.setUpdatesEnabled(False)
+            if on:
+                self.setStyleSheet(DARK_STYLE)
+            else:
+                self.setStyleSheet(LIGHT_STYLE)
+        finally:
+            # 在下一事件循环恢复更新，避免中途多次刷新
+            QTimer.singleShot(0, lambda: self.setUpdatesEnabled(True))
 
     def remove_selected_book(self):
         current_item = self.book_select.currentItem()
