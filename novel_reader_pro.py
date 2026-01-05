@@ -1,4 +1,4 @@
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 import sys
 
 import re
@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QMessageBox, QSpinBox, QCheckBox,
     QInputDialog, QToolBar, QStatusBar, QProgressDialog
 )
-from PySide6.QtGui import QFont, QAction, QTextOption
+from PySide6.QtGui import QFont, QAction, QTextOption, QKeySequence, QShortcut
 from PySide6.QtCore import Qt, QTimer, Signal
 # 可选引入：WebEngine 用于真·直排（writing-mode）
 try:
@@ -57,7 +57,7 @@ BOOKS_DIR.mkdir(parents=True, exist_ok=True)
 LIB_FILE = APP_DIR / "library.json"
 SETTINGS_FILE = APP_DIR / "settings.json"
 
-setup_app_logger(str(APP_DIR / "app.log") ,add_console=False) #是否开启控制台日志输出
+setup_app_logger(str(APP_DIR / "app.log") ,add_console=True) #是否开启控制台日志输出
 logging.info("应用启动")
 # English: Application started
 # logging.info("Application started")
@@ -309,9 +309,10 @@ class NovelReaderSidebarFixed(QMainWindow):
         search_row = QHBoxLayout()
         search_row.setSpacing(4)
         self.chapter_search = QLineEdit()
-        self.chapter_search.setPlaceholderText("搜索章节")
+        self.chapter_search.setPlaceholderText("搜索章节（回车搜索）")
         self.chapter_search.setMaximumWidth(160)
         self.chapter_search.setMaximumHeight(32)
+        self.chapter_search.returnPressed.connect(self.search_chapter)  # 支持回车搜索
         self.search_btn = QPushButton("搜索")
         self.search_btn.clicked.connect(self.search_chapter)
         self.search_btn.setMaximumHeight(32)
@@ -411,9 +412,40 @@ class NovelReaderSidebarFixed(QMainWindow):
         act = QAction("导入书籍", self)
         act.triggered.connect(self.import_book_dialog_async)
         tb.addAction(act)
+        
+        # 设置键盘快捷键
+        self._setup_shortcuts()
+        
         self.refresh_book_select_list()
         self.apply_night_mode(self.night_cb.isChecked())
         
+    def _setup_shortcuts(self):
+        """设置键盘快捷键"""
+        # 上一章：左箭头 / PageUp
+        prev_shortcut1 = QShortcut(QKeySequence(Qt.Key_Left), self)
+        prev_shortcut1.activated.connect(self.go_to_prev_chapter)
+        prev_shortcut2 = QShortcut(QKeySequence(Qt.Key_PageUp), self)
+        prev_shortcut2.activated.connect(self.go_to_prev_chapter)
+        
+        # 下一章：右箭头 / PageDown
+        next_shortcut1 = QShortcut(QKeySequence(Qt.Key_Right), self)
+        next_shortcut1.activated.connect(self.go_to_next_chapter)
+        next_shortcut2 = QShortcut(QKeySequence(Qt.Key_PageDown), self)
+        next_shortcut2.activated.connect(self.go_to_next_chapter)
+        
+        # 聚焦搜索框：Ctrl+F
+        search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_shortcut.activated.connect(self.focus_search)
+        
+        # 切换夜间模式：Ctrl+D
+        night_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
+        night_shortcut.activated.connect(lambda: self.night_cb.setChecked(not self.night_cb.isChecked()))
+    
+    def focus_search(self):
+        """聚焦到搜索框"""
+        self.chapter_search.setFocus()
+        self.chapter_search.selectAll()
+    
     def closeEvent(self, event):
         """程序关闭时清理资源"""
         # 清理章节获取线程（优雅退出）
@@ -448,11 +480,20 @@ class NovelReaderSidebarFixed(QMainWindow):
 
     # UI / business methods (behaviour unchanged; where parsing occurs we call component)
     def refresh_book_select_list(self):
+        """刷新书籍列表，显示阅读进度"""
         self.book_select.setUpdatesEnabled(False)
         self.book_select.clear()
         for bid, meta in self.library.items():
             title = meta.get("title") or meta.get("index_url") or bid
-            item = QListWidgetItem(title)
+            # 添加阅读进度信息
+            chapter_index = meta.get("chapter_index", 0)
+            total_chapters = len(meta.get("chapters", []))
+            if total_chapters > 0:
+                progress = int((chapter_index + 1) / total_chapters * 100)
+                display_text = f"{title} [{progress}%]"
+            else:
+                display_text = title
+            item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, bid)
             self.book_select.addItem(item)
         self.book_select.setUpdatesEnabled(True)
@@ -637,8 +678,11 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.chapter_by_idx = {}
 
     def search_chapter(self):
+        """搜索章节（支持章节号和标题关键词）"""
         q = self.chapter_search.text().strip()
-        if not q: return
+        if not q: 
+            self.status.showMessage("请输入搜索内容", 2000)
+            return
         try:
             n = int(q)
             for i in range(self.chapter_list.count()):
@@ -740,7 +784,8 @@ class NovelReaderSidebarFixed(QMainWindow):
             self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
         )
         
-        self.render_html(html)
+        # 章节切换时重置滚动位置到顶部
+        self.render_html(html, reset_scroll=True)
         self._current_raw_content = content
         self.library[self.current_book_id]["chapter_index"] = index - 1
         self._library_dirty = True
@@ -776,8 +821,9 @@ class NovelReaderSidebarFixed(QMainWindow):
         self.prev_btn.setEnabled(current_index > 0)
         self.next_btn.setEnabled(current_index < total_chapters - 1)
         
-        # 更新章节信息
-        self.chapter_info.setText(f"章节 {current_index + 1}/{total_chapters}")
+        # 更新章节信息（添加进度百分比）
+        progress_pct = int((current_index + 1) / total_chapters * 100) if total_chapters > 0 else 0
+        self.chapter_info.setText(f"章节 {current_index + 1}/{total_chapters} ({progress_pct}%)")
 
     def get_current_chapter_index(self):
         """获取当前章节在列表中的索引"""
@@ -838,8 +884,13 @@ class NovelReaderSidebarFixed(QMainWindow):
     # ========== 直排渲染相关 ==========
 
 
-    def render_html(self, html):
-        """按当前模式渲染 HTML 到合适的视图"""
+    def render_html(self, html, reset_scroll=False):
+        """按当前模式渲染 HTML 到合适的视图
+        
+        参数:
+            html: 要渲染的HTML内容
+            reset_scroll: 是否重置滚动位置到顶部（切换章节时应为True）
+        """
         vertical = self.settings.get("vertical_mode", False)
         if vertical and getattr(self, 'web_view', None):
             vhtml = wrap_vertical_html(
@@ -861,21 +912,35 @@ class NovelReaderSidebarFixed(QMainWindow):
             except Exception:
                 pass
         else:
-            # 保留滚动位置，禁用更新后替换内容，避免闪烁
-            try:
-                sb = self.text_browser.verticalScrollBar()
-                pos = sb.value() if sb else 0
-            except Exception:
-                sb = None
-                pos = 0
-            self.text_browser.setUpdatesEnabled(False)
-            self.text_browser.setHtml(html)
-            self.text_browser.setUpdatesEnabled(True)
-            try:
-                if sb:
-                    sb.setValue(pos)
-            except Exception:
-                pass
+            # 横排模式：根据reset_scroll参数决定是否保留滚动位置
+            if reset_scroll:
+                # 切换章节时：重置到顶部
+                self.text_browser.setUpdatesEnabled(False)
+                self.text_browser.setHtml(html)
+                self.text_browser.setUpdatesEnabled(True)
+                # 确保滚动到顶部
+                try:
+                    sb = self.text_browser.verticalScrollBar()
+                    if sb:
+                        sb.setValue(0)
+                except Exception:
+                    pass
+            else:
+                # 样式切换等操作：保留滚动位置
+                try:
+                    sb = self.text_browser.verticalScrollBar()
+                    pos = sb.value() if sb else 0
+                except Exception:
+                    sb = None
+                    pos = 0
+                self.text_browser.setUpdatesEnabled(False)
+                self.text_browser.setHtml(html)
+                self.text_browser.setUpdatesEnabled(True)
+                try:
+                    if sb:
+                        sb.setValue(pos)
+                except Exception:
+                    pass
 
     def toggle_vertical_mode(self, on):
         """切换直排模式"""
@@ -888,7 +953,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         if on and not getattr(self, 'web_view', None):
             QMessageBox.information(self, "直排不可用", "当前环境未检测到 WebEngine 组件，已继续使用横排显示。如需直排，请安装 PySide6（包含 QtWebEngine）后重启应用。")
 
-        # 重新渲染当前内容
+        # 重新渲染当前内容（样式切换，保留滚动位置）
         if getattr(self, "_current_raw_content", None) is not None:
             html = process_chapter_content_for_display(
                 self._current_raw_content,
@@ -898,7 +963,7 @@ class NovelReaderSidebarFixed(QMainWindow):
                 self.settings.get("night_mode", False),
                 self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
             )
-            self.render_html(html)
+            self.render_html(html, reset_scroll=False)
         elif getattr(self, 'web_view', None) and on:
             self.web_view.setHtml("")
 
@@ -907,7 +972,7 @@ class NovelReaderSidebarFixed(QMainWindow):
         self._settings_dirty = True
         self.base_font.setPointSize(v)
         self.text_browser.setFont(self.base_font)
-        # 重新渲染当前内容（使用原始文本，保持一致性）
+        # 重新渲染当前内容（使用原始文本，保持一致性，保留滚动位置）
         if getattr(self, "_current_raw_content", None) is not None:
             html = process_chapter_content_for_display(
                 self._current_raw_content,
@@ -917,13 +982,13 @@ class NovelReaderSidebarFixed(QMainWindow):
                 self.settings.get("night_mode", False),
                 self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
             )
-            self.render_html(html)
+            self.render_html(html, reset_scroll=False)
 
     def toggle_night_mode(self, on):
         self.settings["night_mode"] = on
         self._settings_dirty = True
         self.apply_night_mode(on)
-        # 夜间模式切换后，基于原始文本重新渲染以保持一致性
+        # 夜间模式切换后，基于原始文本重新渲染以保持一致性（保留滚动位置）
         if getattr(self, "_current_raw_content", None) is not None:
             html = process_chapter_content_for_display(
                 self._current_raw_content,
@@ -933,7 +998,7 @@ class NovelReaderSidebarFixed(QMainWindow):
                 self.settings.get("night_mode", False),
                 self.settings.get("text_color", DEFAULT_SETTINGS["text_color"])
             )
-            self.render_html(html)
+            self.render_html(html, reset_scroll=False)
 
     def apply_night_mode(self, on):
         # 切换样式前短暂禁用更新，减少整窗重绘引起的闪烁
