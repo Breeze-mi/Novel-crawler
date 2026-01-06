@@ -1,4 +1,4 @@
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 import sys
 
 import re
@@ -36,6 +36,13 @@ from analysis_index import (
 )
 # 导入样式
 from styles import DARK_STYLE, LIGHT_STYLE, wrap_vertical_html
+# 导入搜索模块
+try:
+    from kele_search_window import SearchWindow
+    SEARCH_AVAILABLE = True
+except ImportError:
+    SEARCH_AVAILABLE = False
+    logging.warning("搜索模块未安装，搜索功能不可用")
 
 
 if getattr(sys, 'frozen', False):
@@ -409,9 +416,20 @@ class NovelReaderSidebarFixed(QMainWindow):
 
         tb = QToolBar("工具")
         self.addToolBar(tb)
-        act = QAction("导入书籍", self)
-        act.triggered.connect(self.import_book_dialog_async)
-        tb.addAction(act)
+        
+        # 导入书籍按钮
+        act_import = QAction("导入书籍", self)
+        act_import.triggered.connect(self.import_book_dialog_async)
+        tb.addAction(act_import)
+        
+        # 搜索书籍按钮
+        if SEARCH_AVAILABLE:
+            act_search = QAction("搜索书籍", self)
+            act_search.triggered.connect(self.show_search_window)
+            tb.addAction(act_search)
+        
+        # 搜索窗口（初始为 None）
+        self.search_window = None
         
         # 设置键盘快捷键
         self._setup_shortcuts()
@@ -512,6 +530,63 @@ class NovelReaderSidebarFixed(QMainWindow):
         # logging.info(f"import book requested: url='{url}'")
         self._start_index_fetch(url, "正在导入目录…", "正在导入", 
                                lambda chapters, error: self._handle_index_fetch_result(chapters, error, is_import=True, url=url))
+
+    def show_search_window(self):
+        """显示搜索窗口"""
+        if not SEARCH_AVAILABLE:
+            QMessageBox.warning(
+                self, 
+                "功能不可用", 
+                "搜索功能模块未找到。\n\n"
+                "请确保 kele_search_window.py 和 kele_search.py 文件存在。"
+            )
+            return
+        
+        # 如果窗口已存在，直接显示并激活
+        if self.search_window is not None:
+            # 同步夜间模式
+            self.search_window.set_night_mode(self.settings.get("night_mode", False))
+            self.search_window.setStyleSheet(self.styleSheet())
+            self.search_window.show()
+            self.search_window.activateWindow()
+            self.search_window.raise_()
+            return
+        
+        # 创建新的搜索窗口
+        self.search_window = SearchWindow(self)
+        # 同步夜间模式和样式
+        self.search_window.set_night_mode(self.settings.get("night_mode", False))
+        self.search_window.setStyleSheet(self.styleSheet())
+        self.search_window.book_selected.connect(self.on_search_book_selected)
+        self.search_window.show()
+    
+    def on_search_book_selected(self, book_url: str, book_title: str):
+        """从搜索窗口选择书籍后的处理"""
+        # 确认导入
+        ok = QMessageBox.question(
+            self, 
+            "版权提醒", 
+            f"即将导入：{book_title}\n\n"
+            "请确保你抓取内容仅用于个人学习/备份。继续导入？"
+        )
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        
+        logging.info(f"从搜索导入书籍: url='{book_url}', title='{book_title}'")
+        
+        # 启动异步导入
+        self._start_index_fetch(
+            book_url, 
+            "正在导入目录…", 
+            "正在导入", 
+            lambda chapters, error: self._handle_index_fetch_result(
+                chapters, error, is_import=True, url=book_url
+            )
+        )
+    
+    def search_book_dialog(self):
+        """打开搜索书籍对话框（保留兼容性）"""
+        self.show_search_window()
 
     def refresh_current_book_index_async(self):
         if not self.current_book_id:
